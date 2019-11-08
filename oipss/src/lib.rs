@@ -24,17 +24,17 @@ impl<'a> fmt::Debug for LongestCommonSubstring<'a> {
 
 impl<'a> LongestCommonSubstring<'a> {
     #[inline(always)]
-    fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.text[self.start..self.start + self.len]
     }
 
     #[inline(always)]
-    fn start(&self) -> usize {
+    pub fn start(&self) -> usize {
         self.start
     }
 
     #[inline(always)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 }
@@ -224,7 +224,7 @@ impl<'a> SuffixArray<'a> {
 }
 
 /// Returns the number of bytes common to a and b
-fn matchlen(a: &[u8], b: &[u8]) -> usize {
+pub fn matchlen(a: &[u8], b: &[u8]) -> usize {
     let l = std::cmp::min(a.len(), b.len());
     for i in 0..l {
         if a[i] != b[i] {
