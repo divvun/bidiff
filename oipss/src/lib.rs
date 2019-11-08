@@ -2,6 +2,8 @@
 #![allow(nonstandard_style)]
 use log::*;
 
+const empty: usize = usize::max_value();
+
 trait Offset {
     fn offset(&self, second: &Self) -> usize;
 }
@@ -15,7 +17,9 @@ impl<'a> Offset for &'a [u16] {
     }
 }
 
-pub struct Workspace {}
+pub struct SuffixArray {
+    indices: Vec<usize>,
+}
 
 // cf. https://arxiv.org/pdf/1610.08305.pdf
 
@@ -25,7 +29,7 @@ enum Type {
     L,
 }
 
-impl Workspace {
+impl SuffixArray {
     pub fn new(input: &[u8]) -> Self {
         // transform &[u8] into &[u16] so we can have '0' as marker value.
         // TODO: get rid of marker value if possible
@@ -37,11 +41,10 @@ impl Workspace {
         let n = T.len();
 
         // returns the suffix starting at `i` in `T`
-        let Empty = n;
         let suf = |i: usize| -> &[u16] { &T[i..] };
 
-        const alphabet_size: usize = 257;
-        let mut bucket_sizes = [0usize; 257];
+        const alphabet_size: usize = 256;
+        let mut bucket_sizes = [0usize; 256];
 
         // buckets contain all suffixes that start with a given character
         // (there are `alphabet_size` buckets in total)
@@ -93,7 +96,7 @@ impl Workspace {
         };
 
         /// Suffix array
-        let mut SA = vec![Empty; T.len()];
+        let mut SA = vec![empty; T.len()];
 
         // Insert unsorted S-suffixes at tail of their buckets
         for i in 0..n {
@@ -147,16 +150,6 @@ impl Workspace {
             }
         }
 
-        for win in SA.windows(2) {
-            if let &[i, j] = win {
-                if !(suf(i) <= suf(j)) {
-                    panic!("Sequence {} > {}", i, j);
-                }
-            } else {
-                unreachable!()
-            }
-        }
-
         println!(
             "{:^8} = {}",
             "Index",
@@ -203,17 +196,32 @@ impl Workspace {
                 .join(" ")
         );
 
-        Workspace {}
+        Self { indices: SA }
+    }
+
+    pub fn check_valid(&self, input: &[u8]) {
+        let suf = |i: usize| -> &[u8] { &input[i..] };
+
+        for win in self.indices.windows(2) {
+            if let &[i, j] = win {
+                if !(suf(i) <= suf(j)) {
+                    panic!("Sequence {:?} > {:?}", suf(i), suf(j));
+                }
+            } else {
+                unreachable!()
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::Workspace;
+    use crate::SuffixArray;
 
     #[test]
     fn it_works() {
         let input: &[u8] = &[1, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1, 0];
-        Workspace::new(input);
+        let sa = SuffixArray::new(input);
+        sa.check_valid(input);
     }
 }
