@@ -1,3 +1,4 @@
+#![allow(unused)]
 use async_std::{fs, task};
 use anyhow::anyhow;
 use std::time::Instant;
@@ -23,13 +24,13 @@ fn main() -> anyhow::Result<()> {
         };
 
         let start = Instant::now();
-        info!("Older file: {}", older);
-        info!("Newer file: {}", newer);
+        // info!("Older file: {}", older);
+        // info!("Newer file: {}", newer);
         let mut older = Box::pin(fs::File::open(older).await?);
         let mut newer = Box::pin(fs::File::open(newer).await?);
 
         bidiff::diff(older.as_mut(), newer.as_mut()).await?;
-        info!("Completed in {:?}", start.elapsed());
+        // info!("Completed in {:?}", start.elapsed());
 
         Ok(())
     });
