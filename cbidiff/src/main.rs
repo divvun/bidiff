@@ -1,6 +1,6 @@
 #![allow(unused)]
 use anyhow::anyhow;
-use async_std::{fs, task};
+use async_std::{fs, future::try_join, prelude::*, task};
 use log::*;
 use std::time::Instant;
 
@@ -24,21 +24,38 @@ fn main() -> anyhow::Result<()> {
         };
 
         let start = Instant::now();
-        info!("Older file: {}", older);
-        // info!("Newer file: {}", newer);
         let mut older = Box::pin(fs::File::open(older).await?);
         let mut newer = Box::pin(fs::File::open(newer).await?);
 
-        bidiff::diff(older.as_mut(), newer.as_mut(), |m| {
-            if m.eoc {
-                return;
-            }
-            eprintln!(
-                "=> aos={} ans={} al={} ce={}",
-                m.add_old_start, m.add_new_start, m.add_length, m.copy_end
-            );
-        })
-        .await?;
+        let mut obuf = Vec::new();
+        let mut nbuf = Vec::new();
+
+        {
+            let a = older.read_to_end(&mut obuf);
+            let b = newer.read_to_end(&mut nbuf);
+            try_join!(a, b).await?;
+        }
+
+        let mut translator = bidiff::Translator::new(
+            &obuf[..],
+            &nbuf[..],
+            |control| -> Result<(), std::io::Error> {
+                println!("control = {:?}", control);
+                Ok(())
+            },
+        );
+
+        bidiff::diff(&obuf[..], &nbuf[..], |m| -> Result<(), std::io::Error> {
+            translator.translate(m)?;
+            // eprintln!(
+            //     "=> aos={} ans={} al={} ce={}",
+            //     m.add_old_start, m.add_new_start, m.add_length, m.copy_end
+            // );
+            Ok(())
+        })?;
+
+        translator.close()?;
+
         info!("Completed in {:?}", start.elapsed());
 
         Ok(())

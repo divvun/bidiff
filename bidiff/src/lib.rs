@@ -10,27 +10,89 @@ pub struct Match {
     pub add_new_start: usize,
     pub add_length: usize,
     pub copy_end: usize,
-    pub eoc: bool,
+}
+
+impl Match {
+    #[inline(always)]
+    pub fn copy_start(&self) -> usize {
+        self.add_new_start + self.add_length
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Control<'a> {
+    add: &'a [u8],
+    copy: &'a [u8],
+    seek: isize,
+}
+
+pub struct Translator<'a, F, E>
+where
+    F: Fn(&Control) -> Result<(), E>,
+    E: std::error::Error,
+{
+    obuf: &'a [u8],
+    nbuf: &'a [u8],
+    prev_match: Option<Match>,
+    buf: Vec<u8>,
+    on_control: F,
+}
+
+impl<'a, F, E> Translator<'a, F, E>
+where
+    F: Fn(&Control) -> Result<(), E>,
+    E: std::error::Error,
+{
+    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], on_control: F) -> Self {
+        Self {
+            obuf,
+            nbuf,
+            buf: Vec::with_capacity(16 * 1024),
+            prev_match: None,
+            on_control,
+        }
+    }
+
+    fn send_control(&mut self, m: Option<&Match>) -> Result<(), E> {
+        if let Some(pm) = self.prev_match.take() {
+            (self.on_control)(&Control {
+                add: &self.buf[..pm.add_length],
+                copy: &self.nbuf[pm.copy_start()..pm.copy_end],
+                seek: if let Some(m) = m {
+                    m.add_old_start as isize - (pm.add_old_start + pm.add_length) as isize
+                } else {
+                    0
+                },
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn translate(&mut self, m: Match) -> Result<(), E> {
+        self.send_control(Some(&m))?;
+
+        self.buf.clear();
+        self.buf.reserve(m.add_length);
+        for i in 0..m.add_length {
+            self.buf
+                .push(self.nbuf[m.add_new_start + i] - self.obuf[m.add_old_start + i]);
+        }
+
+        self.prev_match = Some(m);
+        Ok(())
+    }
+
+    pub fn close(mut self) -> Result<(), E> {
+        self.send_control(None)?;
+        Ok(())
+    }
 }
 
 /// Diff two files
-pub async fn diff<F>(
-    mut older: Pin<&mut dyn Read>,
-    mut newer: Pin<&mut dyn Read>,
-    on_match: F,
-) -> Result<(), async_std::io::Error>
+pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], mut on_match: F) -> Result<(), E>
 where
-    F: Fn(Match),
+    F: FnMut(Match) -> Result<(), E>,
 {
-    let mut obuf = Vec::new();
-    let mut nbuf = Vec::new();
-
-    {
-        let a = older.read_to_end(&mut obuf);
-        let b = newer.read_to_end(&mut nbuf);
-        try_join!(a, b).await?;
-    }
-
     let obuflen = obuf.len();
     let nbuflen = nbuf.len();
 
@@ -188,8 +250,7 @@ where
                     add_new_start: lastscan,
                     add_length: lenf,
                     copy_end: scan - lenb,
-                    eoc: false,
-                });
+                })?;
 
                 if done_scanning {
                     break 'outer;
@@ -201,14 +262,6 @@ where
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
     }
-
-    on_match(Match {
-        add_old_start: 0,
-        add_new_start: 0,
-        add_length: 0,
-        copy_end: 0,
-        eoc: true,
-    });
 
     Ok(())
 }
