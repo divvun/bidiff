@@ -27,6 +27,8 @@ enum Type {
 
 impl Workspace {
     pub fn new(input: &[u8]) -> Self {
+        // transform &[u8] into &[u16] so we can have '0' as marker value.
+        // TODO: get rid of marker value if possible
         let mut T = Vec::<u16>::new();
         for &c in input {
             T.push(1 + c as u16);
@@ -34,12 +36,18 @@ impl Workspace {
         T.push(0);
         let n = T.len();
 
+        // returns the suffix starting at `i` in `T`
+        let Empty = n;
         let suf = |i: usize| -> &[u16] { &T[i..] };
 
         // let alphabet_size = 257;
-        let alphabet_size = 6;
+        let alphabet_size = 6; // FIXME: this keeps debug output low
         let mut bucket_sizes = vec![0usize; alphabet_size];
 
+        // buckets contain all suffixes that start with a given character
+        // (there are `alphabet_size` buckets in total)
+        // compute buckets and determine whether sequences are S-type or L-type
+        // in a single go.
         let mut Type = vec![Type::S; T.len()];
         for i in 0..n {
             bucket_sizes[T[i] as usize] += 1;
@@ -50,24 +58,32 @@ impl Workspace {
                 Type::L
             }
         }
-        Type[n - 1] = Type::S; // T[n-1] is S-type by definition
+
+        // note: T[n-1] is S-type by definition, but we let
+        // the previous for loop iterate until `n-1` included,
+        // so that `bucket_sizes` is filled properly.
+        Type[n - 1] = Type::S;
 
         dbg!(&bucket_sizes);
 
-        let mut bucket_lf = vec![0 as usize; alphabet_size];
-        let mut bucket_rf = vec![0 as usize; alphabet_size];
+        // leftmost-free position, per bucket
+        let mut lf = vec![0 as usize; alphabet_size];
+        // rightmost-free position, per bucket
+        let mut rf = vec![0 as usize; alphabet_size];
 
         {
             let mut pos = 0usize;
             for character in 0..alphabet_size {
-                bucket_lf[character] = std::cmp::min(n - 1, pos);
-                bucket_rf[character] = pos + bucket_sizes[character] - 1;
+                lf[character] = std::cmp::min(n - 1, pos);
+                rf[character] = pos + bucket_sizes[character] - 1;
                 pos += bucket_sizes[character];
             }
         }
-        dbg!(&bucket_lf);
-        dbg!(&bucket_rf);
+        dbg!(&lf);
+        dbg!(&rf);
 
+        // Convenience function (for debug) that returns
+        // which bucket a given index of SA corresponds to;
         let bucket_at = |i: usize| -> usize {
             let mut pos = 0usize;
             let mut bucket_number = 0;
@@ -81,16 +97,18 @@ impl Workspace {
             bucket_number
         };
 
-        let mut SA = vec![n; T.len()];
+        /// Suffix array
+        let mut SA = vec![Empty; T.len()];
 
+        // Insert unsorted S-suffixes at tail of their buckets
         for i in 0..n {
             if Type[i] == Type::S {
                 // insert at rf in relevant bucket
-                let rf = bucket_rf[T[i] as usize];
-                SA[rf] = i;
+                let pos = rf[T[i] as usize];
+                SA[pos] = i;
 
-                if rf > 0 {
-                    bucket_rf[T[i] as usize] -= 1;
+                if pos > 0 {
+                    rf[T[i] as usize] -= 1;
                 } else {
                     // well rf is gonna be 0 instead of -1 now,
                     // but that's the price of using usize I guess?
@@ -100,12 +118,13 @@ impl Workspace {
             }
         }
 
+        // Sort S-suffixes
         for character in 0..alphabet_size {
-            let l = bucket_rf[character] + 1;
+            let l = rf[character] + 1;
             let r = if character == alphabet_size - 1 {
                 SA.len()
             } else {
-                bucket_lf[character + 1]
+                lf[character + 1]
             };
             if l >= SA.len() {
                 // empty bucket, ignore
@@ -116,6 +135,30 @@ impl Workspace {
 
             s_type_suffixes.sort_by(|&a, &b| suf(a).cmp(suf(b)));
             dbg!(("sorted", character, &s_type_suffixes));
+        }
+
+        // Induced sorting all L-suffixes sorting from the sorted S-suffixes
+        // Scan SA from left to right
+        for i in 0..n {
+            dbg!(i);
+            dbg!(SA[i]);
+            if (SA[i] == 0) {
+                continue;
+            }
+            let j = SA[i] - 1;
+            dbg!(j);
+            dbg!(Type[j]);
+            // If suf(j) is an L-suffix (indicated by the type array)
+            if Type[j] == Type::L {
+                let bucket = T[j] as usize;
+
+                // we place the index of suf(j) (ie. j)
+                // into the LF-entry of bucket T[j]
+                dbg!(lf[bucket]);
+                SA[lf[bucket]] = j;
+                lf[bucket] += 1; // move leftmost-free one to the right
+                dbg!(&SA);
+            }
         }
 
         println!(

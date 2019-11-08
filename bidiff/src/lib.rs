@@ -3,6 +3,11 @@ use async_std::{prelude::*, io::Read, future::try_join};
 use std::pin::Pin;
 use log::*;
 
+pub fn test_oibss() {
+    let input: &[u8] = &[1, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1, 0];
+    oipss::Workspace::new(input);
+}
+
 /// Diff two files
 pub async fn diff(mut older: Pin<&mut dyn Read>, mut newer: Pin<&mut dyn Read>) -> Result<(), async_std::io::Error>
 {
@@ -17,9 +22,6 @@ pub async fn diff(mut older: Pin<&mut dyn Read>, mut newer: Pin<&mut dyn Read>) 
 
     // info!("older is {} bytes", obuf.len());
     // info!("newer is {} bytes", nbuf.len());
-
-    let input: &[u8] = &[1, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1, 0];
-    oipss::Workspace::new(input);
 
     Ok(())
 }
