@@ -21,14 +21,14 @@ impl Match {
 
 #[derive(Debug, Clone)]
 pub struct Control<'a> {
-    add: &'a [u8],
-    copy: &'a [u8],
-    seek: isize,
+    pub add: &'a [u8],
+    pub copy: &'a [u8],
+    pub seek: isize,
 }
 
 pub struct Translator<'a, F, E>
 where
-    F: Fn(&Control) -> Result<(), E>,
+    F: FnMut(&Control) -> Result<(), E>,
     E: std::error::Error,
 {
     obuf: &'a [u8],
@@ -40,7 +40,7 @@ where
 
 impl<'a, F, E> Translator<'a, F, E>
 where
-    F: Fn(&Control) -> Result<(), E>,
+    F: FnMut(&Control) -> Result<(), E>,
     E: std::error::Error,
 {
     pub fn new(obuf: &'a [u8], nbuf: &'a [u8], on_control: F) -> Self {

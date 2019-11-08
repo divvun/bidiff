@@ -1,6 +1,7 @@
 #![allow(unused)]
 use anyhow::anyhow;
 use async_std::{fs, future::try_join, prelude::*, task};
+use byteorder::{LittleEndian, WriteBytesExt};
 use log::*;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ fn main() -> anyhow::Result<()> {
         let args = pico_args::Arguments::from_env();
         let args = Args { free: args.free()? };
 
-        let [older, newer, _patch] = {
+        let [older, newer, patch] = {
             let f = &args.free[..];
             if f.len() != 3 {
                 return Err(anyhow!("Usage: cbidiff OLDER NEWER PATCH"));
@@ -36,11 +37,14 @@ fn main() -> anyhow::Result<()> {
             try_join!(a, b).await?;
         }
 
+        let mut patch = std::fs::File::create(patch)?;
+
         let mut translator = bidiff::Translator::new(
             &obuf[..],
             &nbuf[..],
             |control| -> Result<(), std::io::Error> {
                 println!("control = {:?}", control);
+                write_control(&mut patch, control)?;
                 Ok(())
             },
         );
@@ -55,6 +59,7 @@ fn main() -> anyhow::Result<()> {
         })?;
 
         translator.close()?;
+        patch.flush()?;
 
         info!("Completed in {:?}", start.elapsed());
 
@@ -64,3 +69,19 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+use std::io::Write;
+
+fn write_control(w: &mut dyn Write, c: &bidiff::Control) -> Result<(), std::io::Error> {
+    w.write_u16::<LittleEndian>(0xCAFF)?;
+
+    w.write_u64::<LittleEndian>(c.add.len() as u64)?;
+    w.write_all(c.add)?;
+
+    w.write_u64::<LittleEndian>(c.copy.len() as u64)?;
+    w.write_all(c.copy)?;
+
+    w.write_i64::<LittleEndian>(c.seek as i64)?;
+    Ok(())
+}
+
