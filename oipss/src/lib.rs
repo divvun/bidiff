@@ -61,8 +61,8 @@ impl<'a> SuffixArray<'a> {
         // returns the suffix starting at `i` in `T`
         let suf = |i: usize| -> &[u16] { &T[i..] };
 
-        const alphabet_size: usize = 256;
-        let mut bucket_sizes = [0usize; 256];
+        const alphabet_size: usize = 257;
+        let mut bucket_sizes = [0usize; 257];
 
         // buckets contain all suffixes that start with a given character
         // (there are `alphabet_size` buckets in total)
@@ -168,6 +168,7 @@ impl<'a> SuffixArray<'a> {
             }
         }
 
+        println!();
         println!(
             "{:^8} = {}",
             "Index",
@@ -237,14 +238,8 @@ impl<'a> SuffixArray<'a> {
 
     fn do_search(&self, needle: &[u8], st: usize, en: usize) -> LongestCommonSubstring {
         let I = &self.indices[..];
-        println!("searching in I[{}..{}]", st, en);
 
         if en - st < 2 {
-            // if en >= self.text.len() {
-            //     println!("en {:?} >= text len {:?}, giving up", en, self.text.len());
-            //     return self.lcs(I[st], 1);
-            // }
-
             let x = matchlen(&self.text[I[st]..], needle);
             let y = matchlen(&self.text[I[en]..], needle);
 
@@ -255,17 +250,12 @@ impl<'a> SuffixArray<'a> {
             }
         } else {
             let x = st + (en - st) / 2;
-            println!("{:?}", (st, x, en));
-            // TODO: quadruple-check for off-by-one errors
+
             let l = needle;
             let r = &self.text[I[x]..];
-            println!("l = {:?}", l);
-            println!("r = {:?}", r);
             if l > r {
-                println!("l > r");
                 self.do_search(needle, x, en)
             } else {
-                println!("l <= r");
                 self.do_search(needle, st, x)
             }
         }
@@ -282,10 +272,6 @@ impl<'a> SuffixArray<'a> {
 
 /// Returns the number of bytes common to a and b
 fn matchlen(a: &[u8], b: &[u8]) -> usize {
-    println!("matchlen");
-    println!("a = {:?}", a);
-    println!("b = {:?}", b);
-
     let l = std::cmp::min(a.len(), b.len());
     for i in 0..l {
         if a[i] != b[i] {
@@ -298,6 +284,7 @@ fn matchlen(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::SuffixArray;
+    use proptest::prelude::*;
 
     #[test]
     fn it_works() {
@@ -305,16 +292,28 @@ mod tests {
         let sa = SuffixArray::new(input);
         sa.check_valid();
 
+        // all substrings should be found in input
         for i in 1..input.len() {
-            println!("");
-            println!("========================================");
-            println!("");
-
             let needle = &input[i..];
             let res = sa.search(needle);
-            println!("needle = {:?}", needle);
-            println!("res    = {:?} {:?}", res.as_slice(), res);
             assert_eq!(res.len(), needle.len());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn random_input(input_array: [u8;32]) {
+            let input = &input_array[..];
+
+            let sa = SuffixArray::new(input);
+            sa.check_valid();
+
+            // all substrings should be found in input
+            for i in 1..input.len() {
+                let needle = &input[i..];
+                let res = sa.search(needle);
+                assert_eq!(res.len(), needle.len());
+            }
         }
     }
 }
