@@ -165,7 +165,7 @@ where
 
                 // length forward from lastscan
                 let mut lenf = {
-                    let (mut s, mut sf, mut lenf) = (0, 0, 0);
+                    let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
 
                     for mut i in 0..min(scan - lastscan, obuflen - lastpos) {
                         if obuf[lastpos + i] == nbuf[lastscan + i] {
@@ -176,13 +176,13 @@ where
                             // the original Go code has an `i++` in the
                             // middle of what's essentially a while loop.
                             let i = i + 1;
-                            if s * 2 - i > sf * 2 - lenf {
+                            if s * 2 - i as isize > sf * 2 - lenf {
                                 sf = s;
-                                lenf = i;
+                                lenf = i as isize;
                             }
                         }
                     }
-                    lenf
+                    lenf as usize
                 };
                 println!("lenf={}", lenf);
 

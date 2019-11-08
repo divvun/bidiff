@@ -205,7 +205,7 @@ impl<'a> SuffixArray<'a> {
         //
         // Then we should only start comparing at offset:
         //
-        //   min(lcp(needle, suf(I[st]...)), lcp(needle, suf(I[en]...)))
+        //   min(lcp(needle, suf(SA[st]...)), lcp(needle, suf(SA[en]...)))
         //
         // and *remember that* for the next recursion.
         //
@@ -236,8 +236,8 @@ impl<'a> SuffixArray<'a> {
             // one and not the other, we know who of `x` or `y` is the
             // winner.
             // For long matches, this will remove many comparisons.
-            let x = matchlen(&self.text[I[st]..], needle);
-            let y = matchlen(&self.text[I[en]..], needle);
+            let x = matchlen(&self.text[SA[st]..], needle);
+            let y = matchlen(&self.text[SA[en]..], needle);
 
             if x > y {
                 self.lcs(SA[st], x)
@@ -248,7 +248,7 @@ impl<'a> SuffixArray<'a> {
             let x = st + (en - st) / 2;
 
             let l = needle;
-            let r = &self.text[I[x]..];
+            let r = &self.text[SA[x]..];
             if l > r {
                 self.do_search(needle, x, en)
             } else {
