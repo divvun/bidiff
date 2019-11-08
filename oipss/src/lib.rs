@@ -190,16 +190,59 @@ impl<'a> SuffixArray<'a> {
     }
 
     fn do_search(&self, needle: &[u8], st: usize, en: usize) -> LongestCommonSubstring {
-        let I = &self.indices[..];
+        // TODO: (optimization)
+        //
+        // Let lcp(s1, s2) be the "length of the common prefix" between two sequences.
+        //
+        // Examples:
+        //
+        //    lcp("abc", "abcd") = 3
+        //    lcp("abd", "abcd") = 2
+        //    lcp("abdef", "ab") = 2
+        //
+        // Let suf(i) be the suffix of &self.text starting at index i.
+        // Let SA[i] be the index of suf(i) in sorted suffix order.
+        //
+        // Then we should only start comparing at offset:
+        //
+        //   min(lcp(needle, suf(I[st]...)), lcp(needle, suf(I[en]...)))
+        //
+        // and *remember that* for the next recursion.
+        //
+        // -------------------------------------------------------------
+        //
+        // The idea is as follows:
+        //
+        // Given n such that: lcp(needle, suf(SA[i]...)) >= n
+        //                and lcp(needle, suf(SA[j]...)) >= n
+        //                for i <= j
+        // Then for any k in i...j:
+        //                    lcp(needle, suf(SA[k]...)) >= n
+        // ...so we don't need to compare the first `n` characters
+        //
+        // As for the next iteration, the new (i2, j2) will satisfy:
+        //              i2 >= i
+        //          and j1 <= j
+        //
+        // So we'll have n2 >= n. This also means we can re-use n to
+        // compute n2 (n fewer comparisons are required, compared to
+        // computing n2 from scratch)
+        //
+        let SA = &self.indices[..];
 
         if en - st < 2 {
+            // TODO: (optimization) don't compute *full matchlen*
+            // As soon as we've found a character that's different in
+            // one and not the other, we know who of `x` or `y` is the
+            // winner.
+            // For long matches, this will remove many comparisons.
             let x = matchlen(&self.text[I[st]..], needle);
             let y = matchlen(&self.text[I[en]..], needle);
 
             if x > y {
-                self.lcs(I[st], x)
+                self.lcs(SA[st], x)
             } else {
-                self.lcs(I[en], y)
+                self.lcs(SA[en], y)
             }
         } else {
             let x = st + (en - st) / 2;
