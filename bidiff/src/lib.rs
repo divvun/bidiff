@@ -113,9 +113,6 @@ where
 
         'outer: while scan < nbuflen {
             let mut oldscore = 0_usize;
-            if length > 0 {
-                println!("advancing scan={} by length={}", scan, length);
-            }
             scan += length;
 
             info!("scan = {}", scan);
@@ -143,10 +140,8 @@ where
                 let same_length = (length == oldscore && length != 0);
 
                 if same_length || significantly_better {
-                    println!("break");
                     break 'inner;
                 }
-                println!("oldscore={}, length={}", oldscore, length);
 
                 {
                     let oi = (scan as isize + lastoffset) as usize;
@@ -156,14 +151,9 @@ where
                 }
 
                 scan += 1;
-                println!("scan++, now {}", scan);
             } // 'inner
 
             let done_scanning = scan == nbuflen;
-            println!(
-                "length={} oldscore={} scan={} nbuflen={}",
-                length, oldscore, scan, nbuflen
-            );
             if length != oldscore || done_scanning {
                 for mut i in 0..10 {
                     i += 1;
@@ -190,7 +180,6 @@ where
                     }
                     lenf as usize
                 };
-                println!("lenf={}", lenf);
 
                 // length backwards from scan
                 let mut lenb = {
@@ -208,7 +197,6 @@ where
                     }
                     lenb as usize
                 };
-                println!("lenb={}", lenb);
 
                 let lastscan_was_better = lastscan + lenf > scan - lenb;
                 if lastscan_was_better {
@@ -216,7 +204,6 @@ where
                     // our current scan went back, figure out how much
                     // of our current scan to crop based on scoring
                     let overlap = (lastscan + lenf) - (scan - lenb);
-                    println!("overlap={}", overlap);
 
                     let lens = {
                         let (mut s, mut ss, mut lens) = (0, 0, 0);
@@ -241,9 +228,6 @@ where
                         lens
                     };
 
-                    println!("lenf={}", lenf);
-                    println!("lens={}", lens);
-                    println!("overlap={}", overlap);
                     // order matters to avoid overflow
                     lenf += lens;
                     lenf -= overlap;

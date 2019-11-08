@@ -2,6 +2,7 @@
 use anyhow::anyhow;
 use async_std::{fs, future::try_join, prelude::*, task};
 use byteorder::{LittleEndian, WriteBytesExt};
+use integer_encoding::VarInt;
 use log::*;
 use std::time::Instant;
 
@@ -38,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         let mut patch = std::fs::File::create(patch)?;
+        let mut patch = brotli::CompressorWriter::new(patch, 4096, 11, 22);
 
         let mut translator = bidiff::Translator::new(
             &obuf[..],
@@ -73,15 +75,19 @@ fn main() -> anyhow::Result<()> {
 use std::io::Write;
 
 fn write_control(w: &mut dyn Write, c: &bidiff::Control) -> Result<(), std::io::Error> {
-    w.write_u16::<LittleEndian>(0xCAFF)?;
+    let mut buf = [0u8; 8];
 
-    w.write_u64::<LittleEndian>(c.add.len() as u64)?;
+    let l = (c.add.len() as u64).encode_var(&mut buf[..]);
+    w.write_all(&buf[..l]);
     w.write_all(c.add)?;
 
-    w.write_u64::<LittleEndian>(c.copy.len() as u64)?;
+    let l = (c.copy.len() as u64).encode_var(&mut buf[..]);
+    w.write_all(&buf[..l]);
     w.write_all(c.copy)?;
 
-    w.write_i64::<LittleEndian>(c.seek as i64)?;
+    let l = (c.seek as i64).encode_var(&mut buf[..]);
+    w.write_all(&buf[..l]);
+
     Ok(())
 }
 
