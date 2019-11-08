@@ -39,6 +39,8 @@ where
 
     info!("scanning...");
     {
+        use std::cmp::min;
+
         let mut scan = 0_usize;
         let mut pos = 0_usize;
         let mut length = 0_usize;
@@ -59,15 +61,23 @@ where
                 pos = res.start();
                 length = res.len();
 
-                oldscore += {
-                    let ostart = (scan as isize + lastoffset) as usize;
-                    oipss::matchlen(&obuf[ostart..], &nbuf[scan..])
-                };
+                {
+                    let bound1 = scan + length;
+                    let bound2 = (obuflen as isize - lastoffset) as usize;
+
+                    for scsc in scan..min(bound1, bound2) {
+                        let oi = (scsc as isize + lastoffset) as usize;
+                        if obuf[oi] == nbuf[scsc] {
+                            oldscore += 1;
+                        }
+                    }
+                }
 
                 let significantly_better = length > oldscore + 8;
                 let same_length = (length == oldscore && length != 0);
 
                 if same_length || significantly_better {
+                    println!("break");
                     break 'inner;
                 }
 
@@ -87,8 +97,6 @@ where
                 length, oldscore, scan, nbuflen
             );
             if length != oldscore || done_scanning {
-                use std::cmp::min;
-
                 for mut i in 0..10 {
                     i += 1;
                 }

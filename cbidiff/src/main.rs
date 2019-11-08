@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
             eprintln!(
-                "aos={} ans={} al={} ce={}",
+                "=> aos={} ans={} al={} ce={}",
                 m.add_old_start, m.add_new_start, m.add_length, m.copy_end
             );
         })
