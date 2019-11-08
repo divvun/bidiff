@@ -168,53 +168,6 @@ impl<'a> SuffixArray<'a> {
             }
         }
 
-        println!();
-        println!(
-            "{:^8} = {}",
-            "Index",
-            (0..n)
-                .map(|x| format!("{:3}", x))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        println!(
-            "{:^8} = {}",
-            "T",
-            T.iter()
-                .map(|x| format!("{:3}", x))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        println!(
-            "{:^8} = {}",
-            "Type",
-            Type.iter()
-                .map(|x| format!("{:?}", x))
-                .map(|x| format!("{:>3}", x))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        println!(
-            "{:^8} = {}",
-            "SA",
-            SA.iter()
-                .map(|&x| if x == n {
-                    "  E".to_owned()
-                } else {
-                    format!("{:3}", x)
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        println!(
-            "{:^8} = {}",
-            "Bucket",
-            (0..n)
-                .map(|x| format!("{:3}", bucket_at(x)))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-
         Self { indices: SA, text }
     }
 
