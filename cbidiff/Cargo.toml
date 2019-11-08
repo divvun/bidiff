@@ -1,0 +1,15 @@
+[package]
+name = "cbidiff"
+version = "0.1.0"
+authors = ["Amos Wenger <amoswenger@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+pico-args = "0.3.0"
+bidiff = { path = "../bidiff" }
+async-std = "0.99.12"
+anyhow = "1.0.19"
+log = "0.4.8"
+env_logger = "0.7.1"
