@@ -60,7 +60,7 @@ impl Workspace {
         {
             let mut pos = 0usize;
             for character in 0..alphabet_size {
-                bucket_lf[character] = pos;
+                bucket_lf[character] = std::cmp::min(n - 1, pos);
                 bucket_rf[character] = pos + bucket_sizes[character] - 1;
                 pos += bucket_sizes[character];
             }
@@ -88,6 +88,7 @@ impl Workspace {
                 // insert at rf in relevant bucket
                 let rf = bucket_rf[T[i] as usize];
                 SA[rf] = i;
+
                 if rf > 0 {
                     bucket_rf[T[i] as usize] -= 1;
                 } else {
@@ -97,6 +98,24 @@ impl Workspace {
             } else {
                 // do not insert L-type suffixes yet
             }
+        }
+
+        for character in 0..alphabet_size {
+            let l = bucket_rf[character] + 1;
+            let r = if character == alphabet_size - 1 {
+                SA.len()
+            } else {
+                bucket_lf[character + 1]
+            };
+            if l >= SA.len() {
+                // empty bucket, ignore
+                continue;
+            }
+            let s_type_suffixes = &mut SA[l..r];
+            dbg!(("unsorted", character, &s_type_suffixes));
+
+            s_type_suffixes.sort_by(|&a, &b| suf(a).cmp(suf(b)));
+            dbg!(("sorted", character, &s_type_suffixes));
         }
 
         println!(
