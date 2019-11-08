@@ -75,7 +75,7 @@ where
         self.buf.reserve(m.add_length);
         for i in 0..m.add_length {
             self.buf
-                .push(self.nbuf[m.add_new_start + i] - self.obuf[m.add_old_start + i]);
+                .push(self.nbuf[m.add_new_start + i].wrapping_sub(self.obuf[m.add_old_start + i]));
         }
 
         self.prev_match = Some(m);
@@ -112,8 +112,11 @@ where
         let mut lastoffset = 0_isize;
 
         'outer: while scan < nbuflen {
-            scan += length;
             let mut oldscore = 0_usize;
+            if length > 0 {
+                println!("advancing scan={} by length={}", scan, length);
+            }
+            scan += length;
 
             info!("scan = {}", scan);
 
@@ -127,11 +130,12 @@ where
                     let bound1 = scan + length;
                     let bound2 = (obuflen as isize - lastoffset) as usize;
 
-                    for scsc in scan..min(bound1, bound2) {
+                    while scsc < scan + length {
                         let oi = (scsc as isize + lastoffset) as usize;
-                        if obuf[oi] == nbuf[scsc] {
+                        if oi < obuflen && obuf[oi] == nbuf[scsc] {
                             oldscore += 1;
                         }
+                        scsc += 1;
                     }
                 }
 
@@ -142,6 +146,7 @@ where
                     println!("break");
                     break 'inner;
                 }
+                println!("oldscore={}, length={}", oldscore, length);
 
                 {
                     let oi = (scan as isize + lastoffset) as usize;
@@ -151,11 +156,12 @@ where
                 }
 
                 scan += 1;
+                println!("scan++, now {}", scan);
             } // 'inner
 
             let done_scanning = scan == nbuflen;
             println!(
-                "length={} oldscore={} scan={} buflen={}",
+                "length={} oldscore={} scan={} nbuflen={}",
                 length, oldscore, scan, nbuflen
             );
             if length != oldscore || done_scanning {
