@@ -13,18 +13,29 @@ pub struct SuffixArray<'a> {
 pub struct LongestCommonSubstring<'a> {
     text: &'a [u8],
     start: usize,
-    length: usize,
+    len: usize,
 }
 
 impl<'a> fmt::Debug for LongestCommonSubstring<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "LCS[{}..{}]", self.start, self.start + self.length)
+        write!(f, "LCS[{}..{}]", self.start, self.start + self.len)
     }
 }
 
 impl<'a> LongestCommonSubstring<'a> {
+    #[inline(always)]
     fn as_slice(&self) -> &[u8] {
-        &self.text[self.start..self.start + self.length]
+        &self.text[self.start..self.start + self.len]
+    }
+
+    #[inline(always)]
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -224,21 +235,15 @@ impl<'a> SuffixArray<'a> {
         self.do_search(needle, 0, self.text.len())
     }
 
-    fn lcs(&self, start: usize, length: usize) -> LongestCommonSubstring {
-        LongestCommonSubstring {
-            text: self.text,
-            start,
-            length,
-        }
-    }
-
     fn do_search(&self, needle: &[u8], st: usize, en: usize) -> LongestCommonSubstring {
         let I = &self.indices[..];
+        println!("searching in I[{}..{}]", st, en);
 
         if en - st < 2 {
-            if en >= self.text.len() {
-                return self.lcs(I[st], 1);
-            }
+            // if en >= self.text.len() {
+            //     println!("en {:?} >= text len {:?}, giving up", en, self.text.len());
+            //     return self.lcs(I[st], 1);
+            // }
 
             let x = matchlen(&self.text[I[st]..], needle);
             let y = matchlen(&self.text[I[en]..], needle);
@@ -250,18 +255,37 @@ impl<'a> SuffixArray<'a> {
             }
         } else {
             let x = st + (en - st) / 2;
+            println!("{:?}", (st, x, en));
             // TODO: quadruple-check for off-by-one errors
-            if &self.text[I[x]..] < needle {
+            let l = needle;
+            let r = &self.text[I[x]..];
+            println!("l = {:?}", l);
+            println!("r = {:?}", r);
+            if l > r {
+                println!("l > r");
                 self.do_search(needle, x, en)
             } else {
+                println!("l <= r");
                 self.do_search(needle, st, x)
             }
+        }
+    }
+
+    fn lcs(&self, start: usize, len: usize) -> LongestCommonSubstring {
+        LongestCommonSubstring {
+            text: self.text,
+            start,
+            len,
         }
     }
 }
 
 /// Returns the number of bytes common to a and b
 fn matchlen(a: &[u8], b: &[u8]) -> usize {
+    println!("matchlen");
+    println!("a = {:?}", a);
+    println!("b = {:?}", b);
+
     let l = std::cmp::min(a.len(), b.len());
     for i in 0..l {
         if a[i] != b[i] {
@@ -281,11 +305,16 @@ mod tests {
         let sa = SuffixArray::new(input);
         sa.check_valid();
 
-        {
-            let needle = &[2, 0, 0, 2, 2, 3];
+        for i in 1..input.len() {
+            println!("");
+            println!("========================================");
+            println!("");
+
+            let needle = &input[i..];
             let res = sa.search(needle);
-            dbg!(&res);
-            dbg!(needle, res.as_slice());
+            println!("needle = {:?}", needle);
+            println!("res    = {:?} {:?}", res.as_slice(), res);
+            assert_eq!(res.len(), needle.len());
         }
     }
 }
