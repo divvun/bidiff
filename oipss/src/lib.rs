@@ -1,24 +1,31 @@
 #![allow(unused)]
 #![allow(nonstandard_style)]
 use log::*;
+use std::fmt;
 
 const empty: usize = usize::max_value();
 
-trait Offset {
-    fn offset(&self, second: &Self) -> usize;
+pub struct SuffixArray<'a> {
+    text: &'a [u8],
+    indices: Vec<usize>,
 }
 
-impl<'a> Offset for &'a [u16] {
-    fn offset(&self, second: &Self) -> usize {
-        let fst = self.as_ptr();
-        let snd = second.as_ptr();
+pub struct LongestCommonSubstring<'a> {
+    text: &'a [u8],
+    start: usize,
+    length: usize,
+}
 
-        (snd as usize - fst as usize) / 2
+impl<'a> fmt::Debug for LongestCommonSubstring<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "LCS[{}..{}]", self.start, self.start + self.length)
     }
 }
 
-pub struct SuffixArray {
-    indices: Vec<usize>,
+impl<'a> LongestCommonSubstring<'a> {
+    fn as_slice(&self) -> &[u8] {
+        &self.text[self.start..self.start + self.length]
+    }
 }
 
 // cf. https://arxiv.org/pdf/1610.08305.pdf
@@ -29,12 +36,12 @@ enum Type {
     L,
 }
 
-impl SuffixArray {
-    pub fn new(input: &[u8]) -> Self {
+impl<'a> SuffixArray<'a> {
+    pub fn new(text: &'a [u8]) -> Self {
         // transform &[u8] into &[u16] so we can have '0' as marker value.
         // TODO: get rid of marker value if possible
         let mut T = Vec::<u16>::new();
-        for &c in input {
+        for &c in text {
             T.push(1 + c as u16);
         }
         T.push(0);
@@ -196,11 +203,11 @@ impl SuffixArray {
                 .join(" ")
         );
 
-        Self { indices: SA }
+        Self { indices: SA, text }
     }
 
-    pub fn check_valid(&self, input: &[u8]) {
-        let suf = |i: usize| -> &[u8] { &input[i..] };
+    pub fn check_valid(&self) {
+        let suf = |i: usize| -> &[u8] { &self.text[i..] };
 
         for win in self.indices.windows(2) {
             if let &[i, j] = win {
@@ -212,6 +219,56 @@ impl SuffixArray {
             }
         }
     }
+
+    pub fn search(&self, needle: &[u8]) -> LongestCommonSubstring {
+        self.do_search(needle, 0, self.text.len())
+    }
+
+    fn lcs(&self, start: usize, length: usize) -> LongestCommonSubstring {
+        LongestCommonSubstring {
+            text: self.text,
+            start,
+            length,
+        }
+    }
+
+    fn do_search(&self, needle: &[u8], st: usize, en: usize) -> LongestCommonSubstring {
+        let I = &self.indices[..];
+
+        if en - st < 2 {
+            if en >= self.text.len() {
+                return self.lcs(I[st], 1);
+            }
+
+            let x = matchlen(&self.text[I[st]..], needle);
+            let y = matchlen(&self.text[I[en]..], needle);
+
+            if x > y {
+                self.lcs(I[st], x)
+            } else {
+                self.lcs(I[en], y)
+            }
+        } else {
+            let x = st + (en - st) / 2;
+            // TODO: quadruple-check for off-by-one errors
+            if &self.text[I[x]..] < needle {
+                self.do_search(needle, x, en)
+            } else {
+                self.do_search(needle, st, x)
+            }
+        }
+    }
+}
+
+/// Returns the number of bytes common to a and b
+fn matchlen(a: &[u8], b: &[u8]) -> usize {
+    let l = std::cmp::min(a.len(), b.len());
+    for i in 0..l {
+        if a[i] != b[i] {
+            return i;
+        }
+    }
+    l
 }
 
 #[cfg(test)]
@@ -222,6 +279,13 @@ mod tests {
     fn it_works() {
         let input: &[u8] = &[1, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1, 0];
         let sa = SuffixArray::new(input);
-        sa.check_valid(input);
+        sa.check_valid();
+
+        {
+            let needle = &[2, 0, 0, 2, 2, 3];
+            let res = sa.search(needle);
+            dbg!(&res);
+            dbg!(needle, res.as_slice());
+        }
     }
 }
