@@ -40,9 +40,8 @@ impl Workspace {
         let Empty = n;
         let suf = |i: usize| -> &[u16] { &T[i..] };
 
-        // let alphabet_size = 257;
-        let alphabet_size = 6; // FIXME: this keeps debug output low
-        let mut bucket_sizes = vec![0usize; alphabet_size];
+        const alphabet_size: usize = 257;
+        let mut bucket_sizes = [0usize; 257];
 
         // buckets contain all suffixes that start with a given character
         // (there are `alphabet_size` buckets in total)
@@ -64,8 +63,6 @@ impl Workspace {
         // so that `bucket_sizes` is filled properly.
         Type[n - 1] = Type::S;
 
-        dbg!(&bucket_sizes);
-
         // leftmost-free position, per bucket
         let mut lf = vec![0 as usize; alphabet_size];
         // rightmost-free position, per bucket
@@ -79,15 +76,13 @@ impl Workspace {
                 pos += bucket_sizes[character];
             }
         }
-        dbg!(&lf);
-        dbg!(&rf);
 
         // Convenience function (for debug) that returns
         // which bucket a given index of SA corresponds to;
         let bucket_at = |i: usize| -> usize {
             let mut pos = 0usize;
             let mut bucket_number = 0;
-            for bucket_size in &bucket_sizes {
+            for bucket_size in &bucket_sizes[..] {
                 if pos + bucket_size > i {
                     return bucket_number;
                 }
@@ -131,33 +126,34 @@ impl Workspace {
                 continue;
             }
             let s_type_suffixes = &mut SA[l..r];
-            dbg!(("unsorted", character, &s_type_suffixes));
-
             s_type_suffixes.sort_by(|&a, &b| suf(a).cmp(suf(b)));
-            dbg!(("sorted", character, &s_type_suffixes));
         }
 
         // Induced sorting all L-suffixes sorting from the sorted S-suffixes
         // Scan SA from left to right
         for i in 0..n {
-            dbg!(i);
-            dbg!(SA[i]);
             if (SA[i] == 0) {
                 continue;
             }
             let j = SA[i] - 1;
-            dbg!(j);
-            dbg!(Type[j]);
             // If suf(j) is an L-suffix (indicated by the type array)
             if Type[j] == Type::L {
                 let bucket = T[j] as usize;
 
                 // we place the index of suf(j) (ie. j)
                 // into the LF-entry of bucket T[j]
-                dbg!(lf[bucket]);
                 SA[lf[bucket]] = j;
                 lf[bucket] += 1; // move leftmost-free one to the right
-                dbg!(&SA);
+            }
+        }
+
+        for win in SA.windows(2) {
+            if let &[i, j] = win {
+                if !(suf(i) <= suf(j)) {
+                    panic!("Sequence {} > {}", i, j);
+                }
+            } else {
+                unreachable!()
             }
         }
 
@@ -207,8 +203,17 @@ impl Workspace {
                 .join(" ")
         );
 
-        println!("");
-
         Workspace {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Workspace;
+
+    #[test]
+    fn it_works() {
+        let input: &[u8] = &[1, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1, 0];
+        Workspace::new(input);
     }
 }

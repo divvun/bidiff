@@ -32,8 +32,6 @@ fn main() -> anyhow::Result<()> {
         // bidiff::diff(older.as_mut(), newer.as_mut()).await?;
         // info!("Completed in {:?}", start.elapsed());
 
-        bidiff::test_oibss();
-
         Ok(())
     });
     res?;
