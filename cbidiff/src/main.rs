@@ -45,7 +45,6 @@ fn main() -> anyhow::Result<()> {
             &obuf[..],
             &nbuf[..],
             |control| -> Result<(), std::io::Error> {
-                println!("control = {:?}", control);
                 write_control(&mut patch, control)?;
                 Ok(())
             },

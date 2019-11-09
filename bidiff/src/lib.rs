@@ -3,6 +3,7 @@
 use async_std::{future::try_join, io::Read, prelude::*};
 use log::*;
 use std::pin::Pin;
+use std::time::Instant;
 
 #[derive(Debug)]
 pub struct Match {
@@ -97,8 +98,11 @@ where
     let nbuflen = nbuf.len();
 
     info!("building suffix array...");
+    let before_suffix = Instant::now();
     let sa = oipss::SuffixArray::new(&obuf[..]);
+    info!("sorting took {:?}", before_suffix.elapsed());
 
+    let before_scan = Instant::now();
     info!("scanning...");
     {
         use std::cmp::min;
@@ -114,8 +118,6 @@ where
         'outer: while scan < nbuflen {
             let mut oldscore = 0_usize;
             scan += length;
-
-            info!("scan = {}", scan);
 
             let mut scsc = scan;
             'inner: while scan < nbuflen {
@@ -252,6 +254,7 @@ where
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
     }
+    info!("scan took {:?}", before_scan.elapsed());
 
     Ok(())
 }
