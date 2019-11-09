@@ -99,7 +99,8 @@ where
 
     info!("building suffix array...");
     let before_suffix = Instant::now();
-    let sa = oipss::SuffixArray::new(&obuf[..]);
+    // let sa = oipss::SuffixArray::new(&obuf[..]);
+    let sa = suffix_array::SuffixArray::new(&obuf[..]);
     info!("sorting took {:?}", before_suffix.elapsed());
 
     let before_scan = Instant::now();
@@ -121,9 +122,12 @@ where
 
             let mut scsc = scan;
             'inner: while scan < nbuflen {
-                let res = sa.search(&nbuf[scan..]);
-                pos = res.start();
-                length = res.len();
+                // let res = sa.search(&nbuf[scan..]);
+                // pos = res.start();
+                // length = res.len();
+                let res = sa.search_lcp(&nbuf[scan..]);
+                pos = res.start;
+                length = res.end - res.start;
 
                 {
                     let bound1 = scan + length;

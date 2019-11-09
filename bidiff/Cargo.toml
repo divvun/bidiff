@@ -8,3 +8,4 @@ edition = "2018"
 oipss = { path = "../oipss" }
 async-std = "0.99.12"
 log = "0.4.8"
+suffix_array = "0.4.0"
