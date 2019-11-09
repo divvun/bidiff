@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         let mut patch = std::fs::File::create(patch)?;
-        let mut patch = brotli::CompressorWriter::new(patch, 4096, 11, 22);
+        let mut patch = brotli::CompressorWriter::new(patch, 4096, 9, 19);
 
         let mut translator = bidiff::Translator::new(
             &obuf[..],
