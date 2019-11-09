@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
             let [patch, older, output] = {
                 let f = &args.free[1..];
                 if f.len() != 3 {
-                    return Err(anyhow!("Usage: cbidiff patch OLDER NEWER PATCH"));
+                    return Err(anyhow!("Usage: cbidiff patch PATCH OLDER OUTPUT"));
                 }
                 [&f[0], &f[1], &f[2]]
             };
@@ -71,42 +71,29 @@ where
     let fresh = tmp.join("fresh");
 
     {
+        let older_size = std::fs::metadata(older)?.len();
         let newer_size = std::fs::metadata(newer)?.len();
 
-        info!(
-            "older size: {}",
-            Size::Bytes(std::fs::metadata(older)?.len())
+        println!(
+            "before {}, after {}",
+            Size::Bytes(older_size),
+            Size::Bytes(newer_size),
         );
-        info!("newer size: {}", Size::Bytes(newer_size));
 
         let older_hash = hmac_sha256::Hash::hash(&std::fs::read(older)?);
-        info!(
-            "older hash: {}",
-            &older_hash[..]
-                .iter()
-                .map(|x| format!("{:02x}", x))
-                .collect::<Vec<_>>()
-                .join("")
-        );
 
         do_diff(older, newer, &patch)?;
         do_patch(&patch, older, fresh)?;
 
         let patch_size = std::fs::metadata(patch)?.len();
-        info!("patch size: {}", Size::Bytes(patch_size));
-
         let ratio = (patch_size as f64) / (newer_size as f64);
-        info!("size ratio: {:.2}%", ratio * 100.0);
+        println!(
+            "patch size: {} ({:.2}% of newer)",
+            Size::Bytes(patch_size),
+            ratio * 100.0
+        );
 
         let fresh_hash = hmac_sha256::Hash::hash(&std::fs::read(older)?);
-        info!(
-            "fresh hash: {}",
-            &fresh_hash[..]
-                .iter()
-                .map(|x| format!("{:02x}", x))
-                .collect::<Vec<_>>()
-                .join("")
-        );
 
         if older_hash != fresh_hash {
             return Err(anyhow!("hash mismatch!"));
