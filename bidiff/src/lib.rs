@@ -24,7 +24,7 @@ impl Match {
 pub struct Control<'a> {
     pub add: &'a [u8],
     pub copy: &'a [u8],
-    pub seek: isize,
+    pub seek: i64,
 }
 
 pub struct Translator<'a, F, E>
@@ -60,7 +60,7 @@ where
                 add: &self.buf[..pm.add_length],
                 copy: &self.nbuf[pm.copy_start()..pm.copy_end],
                 seek: if let Some(m) = m {
-                    m.add_old_start as isize - (pm.add_old_start + pm.add_length) as isize
+                    m.add_old_start as i64 - (pm.add_old_start + pm.add_length) as i64
                 } else {
                     0
                 },
