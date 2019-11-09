@@ -117,8 +117,11 @@ where
 
     let mut patch = brotli::Decompressor::new(patch, 64 * 1024);
 
+    let mut buf1 = vec![0u8; 64 * 1024];
+    let mut buf2 = vec![0u8; 64 * 1024];
+
     'read: loop {
-        match read_control(&mut patch, &mut output, &mut older) {
+        match read_control(&mut buf1, &mut buf2, &mut patch, &mut output, &mut older) {
             Err(e) => {
                 match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
@@ -197,29 +200,52 @@ trait ReadSeek: Read + Seek {}
 impl<T> ReadSeek for T where T: Read + Seek {}
 
 fn read_control(
+    buf1: &mut [u8],
+    buf2: &mut [u8],
     mut patch: &mut dyn Read,
     mut output: &mut dyn Write,
     mut older: &mut dyn ReadSeek,
 ) -> Result<(), std::io::Error> {
+    let buflen = buf1.len();
+    assert_eq!(buf1.len(), buf2.len());
+
+    use std::cmp::min;
+
     let add_len: usize = patch.read_varint()?;
     let mut add = vec![0u8; add_len];
 
-    for i in 0..add_len {
-        let a = patch.read_u8()?;
-        let b = older.read_u8()?;
-        let c = a.wrapping_add(b);
-        output.write_all(&[c])?;
+    {
+        let mut remain = add_len;
+        while remain > 0 {
+            let buf1 = &mut buf1[..min(buflen, remain)];
+            let buf2 = &mut buf2[..buf1.len()];
+
+            patch.read_exact(buf1)?;
+            older.read_exact(buf2)?;
+            for i in 0..buf1.len() {
+                buf1[i] = buf1[i].wrapping_add(buf2[i]);
+            }
+            output.write_all(buf1);
+
+            remain -= buf1.len();
+        }
     }
 
     let copy_len: usize = patch.read_varint()?;
-    for i in 0..copy_len {
-        // this is slow, but should be correct
-        let a = patch.read_u8()?;
-        output.write_all(&[a])?;
+    {
+        let mut remain = copy_len;
+        while remain > 0 {
+            let buf = &mut buf1[..min(buflen, remain)];
+            patch.read_exact(buf)?;
+            output.write_all(buf)?;
+            remain -= buf.len();
+        }
     }
 
     let seek: i64 = patch.read_varint()?;
-    older.seek(SeekFrom::Current(seek))?;
+    if seek != 0 {
+        older.seek(SeekFrom::Current(seek))?;
+    }
 
     Ok(())
 }
