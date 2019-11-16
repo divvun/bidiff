@@ -1,10 +1,9 @@
-#![allow(unused)]
-use anyhow::anyhow;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use integer_encoding::{VarIntReader, VarIntWriter};
+use failure::{err_msg, Fallible};
+use integer_encoding::VarIntReader;
 use log::*;
 use size::Size;
 use std::{
+    cmp::min,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -15,19 +14,26 @@ struct Args {
     free: Vec<String>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Fallible<()> {
+    #[cfg(debug_assertions)]
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     env_logger::builder().init();
 
     let args = pico_args::Arguments::from_env();
     let args = Args { free: args.free()? };
 
-    let cmd = args.free[0].as_ref();
+    let cmd = args
+        .free
+        .get(0)
+        .expect("Usage: bic diff|patch|cycle (1)")
+        .as_ref();
     match cmd {
         "diff" => {
             let [older, newer, patch] = {
                 let f = &args.free[1..];
                 if f.len() != 3 {
-                    return Err(anyhow!("Usage: cbidiff diff OLDER NEWER PATCH"));
+                    Err(err_msg("Usage: bic diff OLDER NEWER PATCH"))?;
                 }
                 [&f[0], &f[1], &f[2]]
             };
@@ -37,7 +43,7 @@ fn main() -> anyhow::Result<()> {
             let [patch, older, output] = {
                 let f = &args.free[1..];
                 if f.len() != 3 {
-                    return Err(anyhow!("Usage: cbidiff patch PATCH OLDER OUTPUT"));
+                    Err(err_msg("Usage: bic patch PATCH OLDER OUTPUT"))?;
                 }
                 [&f[0], &f[1], &f[2]]
             };
@@ -47,19 +53,19 @@ fn main() -> anyhow::Result<()> {
             let [older, newer] = {
                 let f = &args.free[1..];
                 if f.len() != 2 {
-                    return Err(anyhow!("Usage: cbidiff cycle OLDER NEWER"));
+                    Err(err_msg("Usage: bic cycle OLDER NEWER"))?;
                 }
                 [&f[0], &f[1]]
             };
             do_cycle(older, newer)?;
         }
-        _ => return Err(anyhow!("Usage: cbidiff diff|patch|cycle")),
+        _ => Err(err_msg("Usage: bic diff|patch|cycle"))?,
     }
 
     Ok(())
 }
 
-fn do_cycle<O, N>(older: O, newer: N) -> anyhow::Result<()>
+fn do_cycle<O, N>(older: O, newer: N) -> Fallible<()>
 where
     O: AsRef<Path>,
     N: AsRef<Path>,
@@ -96,14 +102,14 @@ where
         let fresh_hash = hmac_sha256::Hash::hash(&std::fs::read(older)?);
 
         if older_hash != fresh_hash {
-            return Err(anyhow!("hash mismatch!"));
+            return Err(err_msg("hash mismatch!"));
         }
     }
 
     Ok(())
 }
 
-fn do_patch<P, O, U>(patch: P, older: O, output: U) -> anyhow::Result<()>
+fn do_patch<P, O, U>(patch: P, older: O, output: U) -> Fallible<()>
 where
     P: AsRef<Path>,
     O: AsRef<Path>,
@@ -112,7 +118,7 @@ where
     let start = Instant::now();
 
     let mut older = std::fs::File::open(older)?;
-    let mut patch = std::fs::File::open(patch)?;
+    let patch = std::fs::File::open(patch)?;
     let mut output = std::fs::File::create(output)?;
 
     let mut patch = brotli::Decompressor::new(patch, 64 * 1024);
@@ -128,7 +134,10 @@ where
                         // all good!
                         break 'read;
                     }
-                    _ => Err(e)?,
+                    _ => {
+                        println!("in do_patch, got err {:?}", e);
+                        Err(e)?;
+                    }
                 }
             }
             _ => {}
@@ -140,7 +149,7 @@ where
     Ok(())
 }
 
-fn do_diff<O, N, P>(older: O, newer: N, patch: P) -> anyhow::Result<()>
+fn do_diff<O, N, P>(older: O, newer: N, patch: P) -> Fallible<()>
 where
     O: AsRef<Path>,
     N: AsRef<Path>,
@@ -156,19 +165,11 @@ where
     older.read_to_end(&mut obuf)?;
     newer.read_to_end(&mut nbuf)?;
 
-    let mut patch = std::fs::File::create(patch)?;
-    let mut params = brotli::enc::BrotliEncoderInitParams();
-    params.quality = 9;
-    let mut patch = brotli::CompressorWriter::with_params(patch, 64 * 1024, &params);
+    let patch = std::fs::File::create(patch)?;
+    let mut patch = bidiff::enc::Writer::new(patch)?;
 
-    let mut translator = bidiff::Translator::new(
-        &obuf[..],
-        &nbuf[..],
-        |control| -> Result<(), std::io::Error> {
-            write_control(&mut patch, control)?;
-            Ok(())
-        },
-    );
+    let mut translator =
+        bidiff::Translator::new(&obuf[..], &nbuf[..], |control| patch.write(control));
 
     bidiff::diff(&obuf[..], &nbuf[..], |m| -> Result<(), std::io::Error> {
         translator.translate(m)?;
@@ -183,18 +184,6 @@ where
     Ok(())
 }
 
-fn write_control(mut w: &mut dyn Write, c: &bidiff::Control) -> Result<(), std::io::Error> {
-    w.write_varint(c.add.len())?;
-    w.write_all(c.add)?;
-
-    w.write_varint(c.copy.len())?;
-    w.write_all(c.copy)?;
-
-    w.write_varint(c.seek)?;
-
-    Ok(())
-}
-
 trait ReadSeek: Read + Seek {}
 
 impl<T> ReadSeek for T where T: Read + Seek {}
@@ -203,16 +192,13 @@ fn read_control(
     buf1: &mut [u8],
     buf2: &mut [u8],
     mut patch: &mut dyn Read,
-    mut output: &mut dyn Write,
-    mut older: &mut dyn ReadSeek,
+    output: &mut dyn Write,
+    older: &mut dyn ReadSeek,
 ) -> Result<(), std::io::Error> {
     let buflen = buf1.len();
     assert_eq!(buf1.len(), buf2.len());
 
-    use std::cmp::min;
-
     let add_len: usize = patch.read_varint()?;
-    let mut add = vec![0u8; add_len];
 
     {
         let mut remain = add_len;
@@ -225,7 +211,7 @@ fn read_control(
             for i in 0..buf1.len() {
                 buf1[i] = buf1[i].wrapping_add(buf2[i]);
             }
-            output.write_all(buf1);
+            output.write_all(buf1)?;
 
             remain -= buf1.len();
         }

@@ -1,7 +1,7 @@
 
 [workspace]
 members = [
-    "bidiff",
-    "cbidiff",
-    "oipss"
+    "crates/bidiff",
+    "crates/bipatch",
+    "crates/bic"
 ]

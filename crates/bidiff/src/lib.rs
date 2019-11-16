@@ -1,9 +1,8 @@
-#![allow(unused)]
-
-use async_std::{future::try_join, io::Read, prelude::*};
 use log::*;
-use std::pin::Pin;
 use std::time::Instant;
+
+#[cfg(feature = "enc")]
+pub mod enc;
 
 #[derive(Debug)]
 pub struct Match {
@@ -99,8 +98,7 @@ where
 
     info!("building suffix array...");
     let before_suffix = Instant::now();
-    // let sa = oipss::SuffixArray::new(&obuf[..]);
-    let sa = suffix_array::SuffixArray::new(&obuf[..]);
+    let sa = divsufsort::sort(&obuf[..]);
     info!("sorting took {:?}", before_suffix.elapsed());
 
     let before_scan = Instant::now();
@@ -122,17 +120,11 @@ where
 
             let mut scsc = scan;
             'inner: while scan < nbuflen {
-                // let res = sa.search(&nbuf[scan..]);
-                // pos = res.start();
-                // length = res.len();
-                let res = sa.search_lcp(&nbuf[scan..]);
-                pos = res.start;
-                length = res.end - res.start;
+                let res = sa.longest_substring_match(&nbuf[scan..]);
+                pos = res.start();
+                length = res.len();
 
                 {
-                    let bound1 = scan + length;
-                    let bound2 = (obuflen as isize - lastoffset) as usize;
-
                     while scsc < scan + length {
                         let oi = (scsc as isize + lastoffset) as usize;
                         if oi < obuflen && obuf[oi] == nbuf[scsc] {
@@ -143,7 +135,7 @@ where
                 }
 
                 let significantly_better = length > oldscore + 8;
-                let same_length = (length == oldscore && length != 0);
+                let same_length = length == oldscore && length != 0;
 
                 if same_length || significantly_better {
                     break 'inner;
@@ -161,21 +153,17 @@ where
 
             let done_scanning = scan == nbuflen;
             if length != oldscore || done_scanning {
-                for mut i in 0..10 {
-                    i += 1;
-                }
-
                 // length forward from lastscan
                 let mut lenf = {
                     let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
 
-                    for mut i in 0..min(scan - lastscan, obuflen - lastpos) {
+                    for i in 0..min(scan - lastscan, obuflen - lastpos) {
                         if obuf[lastpos + i] == nbuf[lastscan + i] {
                             s += 1;
                         }
 
                         {
-                            // the original Go code has an `i++` in the
+                            // the original code has an `i++` in the
                             // middle of what's essentially a while loop.
                             let i = i + 1;
                             if s * 2 - i as isize > sf * 2 - lenf {
@@ -254,7 +242,7 @@ where
 
                 lastscan = scan - lenb;
                 lastpos = pos - lenb;
-                lastoffset = (pos as isize - scan as isize);
+                lastoffset = pos as isize - scan as isize;
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
     }
