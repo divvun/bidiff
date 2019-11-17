@@ -10,7 +10,7 @@ enc = ["byteorder", "integer-encoding", "brotli"]
 
 [dependencies]
 log = "0.4.8"
-divsufsort = "1.0.1"
+divsufsort = "1.0.2"
 
 # for enc
 byteorder = { version = "1.3.2", optional = true }
