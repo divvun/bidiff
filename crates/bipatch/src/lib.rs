@@ -32,6 +32,7 @@ where
     buf: Vec<u8>,
 }
 
+#[derive(Debug)]
 enum ReaderState {
     Initial,
     Add(usize),

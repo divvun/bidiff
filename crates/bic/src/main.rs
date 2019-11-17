@@ -2,7 +2,7 @@ use failure::{err_msg, Fallible};
 use log::*;
 use size::Size;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read},
     path::Path,
     time::Instant,
@@ -68,40 +68,44 @@ where
     O: AsRef<Path>,
     N: AsRef<Path>,
 {
+    println!("reading older and newer in memory...");
     let (older, newer) = (older.as_ref(), newer.as_ref());
+    let (older, newer) = (fs::read(older)?, fs::read(newer)?);
 
-    let tmp = std::env::temp_dir();
-    let patch = tmp.join("patch");
-    let fresh = tmp.join("fresh");
+    println!(
+        "before {}, after {}",
+        Size::Bytes(older.len()),
+        Size::Bytes(newer.len()),
+    );
 
+    let mut patch = Vec::new();
+    let before_diff = Instant::now();
+    bidiff::simple_diff(&older[..], &newer[..], &mut patch)?;
+    println!("diffed in {:?}", before_diff.elapsed());
+
+    let ratio = (patch.len() as f64) / (newer.len() as f64);
+    println!(
+        "patch size: {} ({:.2}% of newer)",
+        Size::Bytes(patch.len()),
+        ratio * 100.0
+    );
+
+    let mut fresh = Vec::new();
     {
-        let older_size = std::fs::metadata(older)?.len();
-        let newer_size = std::fs::metadata(newer)?.len();
+        let before_patch = Instant::now();
+        let mut older = io::Cursor::new(&older[..]);
+        let mut r = bipatch::Reader::new(&patch[..], &mut older)?;
+        let fresh_size = io::copy(&mut r, &mut fresh)?;
+        println!("patched in {:?}", before_patch.elapsed());
 
-        println!(
-            "before {}, after {}",
-            Size::Bytes(older_size),
-            Size::Bytes(newer_size),
-        );
+        assert_eq!(fresh_size as usize, newer.len());
+    }
 
-        let older_hash = hmac_sha256::Hash::hash(&std::fs::read(older)?);
+    let newer_hash = hmac_sha256::Hash::hash(&newer[..]);
+    let fresh_hash = hmac_sha256::Hash::hash(&fresh[..]);
 
-        do_diff(older, newer, &patch)?;
-        do_patch(&patch, older, fresh)?;
-
-        let patch_size = std::fs::metadata(patch)?.len();
-        let ratio = (patch_size as f64) / (newer_size as f64);
-        println!(
-            "patch size: {} ({:.2}% of newer)",
-            Size::Bytes(patch_size),
-            ratio * 100.0
-        );
-
-        let fresh_hash = hmac_sha256::Hash::hash(&std::fs::read(older)?);
-
-        if older_hash != fresh_hash {
-            return Err(err_msg("hash mismatch!"));
-        }
+    if newer_hash != fresh_hash {
+        return Err(err_msg("hash mismatch!"));
     }
 
     Ok(())
@@ -161,4 +165,3 @@ where
 
     Ok(())
 }
-

@@ -1,5 +1,8 @@
 use log::*;
-use std::time::Instant;
+use std::{
+    io::{self, Write},
+    time::Instant,
+};
 
 #[cfg(feature = "enc")]
 pub mod enc;
@@ -36,6 +39,7 @@ where
     prev_match: Option<Match>,
     buf: Vec<u8>,
     on_control: F,
+    closed: bool,
 }
 
 impl<'a, F, E> Translator<'a, F, E>
@@ -50,6 +54,7 @@ where
             buf: Vec::with_capacity(16 * 1024),
             prev_match: None,
             on_control,
+            closed: false,
         }
     }
 
@@ -83,8 +88,27 @@ where
     }
 
     pub fn close(mut self) -> Result<(), E> {
-        self.send_control(None)?;
+        self.do_close()
+    }
+
+    fn do_close(&mut self) -> Result<(), E> {
+        if !self.closed {
+            self.send_control(None)?;
+            self.closed = true;
+        }
         Ok(())
+    }
+}
+
+impl<'a, F, E> Drop for Translator<'a, F, E>
+where
+    F: FnMut(&Control) -> Result<(), E>,
+    E: std::error::Error,
+{
+    fn drop(&mut self) {
+        // dropping a Translator ignores errors on purpose,
+        // just like File does
+        self.do_close().unwrap_or_else(|_| {});
     }
 }
 
@@ -250,3 +274,15 @@ where
 
     Ok(())
 }
+
+#[cfg(feature = "enc")]
+pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
+    let mut w = enc::Writer::new(out)?;
+
+    let mut translator = Translator::new(older, newer, |control| w.write(control));
+    diff(older, newer, |m| translator.translate(m))?;
+    translator.close()?;
+
+    Ok(())
+}
+
