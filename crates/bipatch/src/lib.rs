@@ -25,6 +25,15 @@ where
 {
     r: Decompressor<R>,
     old: RS,
+    state: ReaderState,
+    buf: Vec<u8>,
+}
+
+enum ReaderState {
+    Initial,
+    Add(usize),
+    Copy(usize),
+    Final,
 }
 
 impl<R, RS> Reader<R, RS>
@@ -44,7 +53,12 @@ where
         }
 
         let r = Decompressor::new(patch, BROTLI_BUFFER_SIZE);
-        Ok(Self { r, old })
+        Ok(Self {
+            r,
+            old,
+            state: ReaderState::Initial,
+            buf: vec![0u8; 4096],
+        })
     }
 }
 
@@ -53,8 +67,27 @@ where
     R: Read,
     RS: Read + Seek,
 {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unimplemented!()
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        let mut read: usize = 0;
+
+        while !buf.is_empty() {
+            let processed = match self.state {
+                ReaderState::Initial => {
+                    let add_len: usize = self.r.read_varint()?;
+                    self.state = ReaderState::Add(add_len);
+                    0
+                }
+                ReaderState::Add(add_len) => 0,
+                ReaderState::Copy(copy_len) => 0,
+                ReaderState::Final => {
+                    break;
+                }
+            };
+            read += processed;
+            buf = &mut buf[processed..];
+        }
+
+        Ok(read)
     }
 }
 
