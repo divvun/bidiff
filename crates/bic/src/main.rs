@@ -1,11 +1,9 @@
 use failure::{err_msg, Fallible};
-use integer_encoding::VarIntReader;
 use log::*;
 use size::Size;
 use std::{
-    cmp::min,
-    fs,
-    io::{Read, Seek, SeekFrom, Write},
+    fs::File,
+    io::{self, Read},
     path::Path,
     time::Instant,
 };
@@ -33,7 +31,7 @@ fn main() -> Fallible<()> {
             let [older, newer, patch] = {
                 let f = &args.free[1..];
                 if f.len() != 3 {
-                    Err(err_msg("Usage: bic diff OLDER NEWER PATCH"))?;
+                    return Err(err_msg("Usage: bic diff OLDER NEWER PATCH"));
                 }
                 [&f[0], &f[1], &f[2]]
             };
@@ -43,7 +41,7 @@ fn main() -> Fallible<()> {
             let [patch, older, output] = {
                 let f = &args.free[1..];
                 if f.len() != 3 {
-                    Err(err_msg("Usage: bic patch PATCH OLDER OUTPUT"))?;
+                    return Err(err_msg("Usage: bic patch PATCH OLDER OUTPUT"));
                 }
                 [&f[0], &f[1], &f[2]]
             };
@@ -53,13 +51,13 @@ fn main() -> Fallible<()> {
             let [older, newer] = {
                 let f = &args.free[1..];
                 if f.len() != 2 {
-                    Err(err_msg("Usage: bic cycle OLDER NEWER"))?;
+                    return Err(err_msg("Usage: bic cycle OLDER NEWER"));
                 }
                 [&f[0], &f[1]]
             };
             do_cycle(older, newer)?;
         }
-        _ => Err(err_msg("Usage: bic diff|patch|cycle"))?,
+        _ => return Err(err_msg("Usage: bic diff|patch|cycle")),
     }
 
     Ok(())
@@ -117,32 +115,12 @@ where
 {
     let start = Instant::now();
 
-    let mut older = std::fs::File::open(older)?;
-    let patch = std::fs::File::open(patch)?;
-    let mut output = std::fs::File::create(output)?;
+    let older = File::open(older)?;
+    let patch = File::open(patch)?;
+    let mut reader = bipatch::Reader::new(patch, older)?;
 
-    let mut patch = brotli::Decompressor::new(patch, 64 * 1024);
-
-    let mut buf1 = vec![0u8; 64 * 1024];
-    let mut buf2 = vec![0u8; 64 * 1024];
-
-    'read: loop {
-        match read_control(&mut buf1, &mut buf2, &mut patch, &mut output, &mut older) {
-            Err(e) => {
-                match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        // all good!
-                        break 'read;
-                    }
-                    _ => {
-                        println!("in do_patch, got err {:?}", e);
-                        Err(e)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let mut output = File::create(output)?;
+    io::copy(&mut reader, &mut output)?;
 
     info!("Completed in {:?}", start.elapsed());
 
@@ -156,8 +134,8 @@ where
     P: AsRef<Path>,
 {
     let start = Instant::now();
-    let mut older = fs::File::open(older)?;
-    let mut newer = fs::File::open(newer)?;
+    let mut older = File::open(older)?;
+    let mut newer = File::open(newer)?;
 
     let mut obuf = Vec::new();
     let mut nbuf = Vec::new();
@@ -165,7 +143,7 @@ where
     older.read_to_end(&mut obuf)?;
     newer.read_to_end(&mut nbuf)?;
 
-    let patch = std::fs::File::create(patch)?;
+    let patch = File::create(patch)?;
     let mut patch = bidiff::enc::Writer::new(patch)?;
 
     let mut translator =
@@ -184,54 +162,3 @@ where
     Ok(())
 }
 
-trait ReadSeek: Read + Seek {}
-
-impl<T> ReadSeek for T where T: Read + Seek {}
-
-fn read_control(
-    buf1: &mut [u8],
-    buf2: &mut [u8],
-    mut patch: &mut dyn Read,
-    output: &mut dyn Write,
-    older: &mut dyn ReadSeek,
-) -> Result<(), std::io::Error> {
-    let buflen = buf1.len();
-    assert_eq!(buf1.len(), buf2.len());
-
-    let add_len: usize = patch.read_varint()?;
-
-    {
-        let mut remain = add_len;
-        while remain > 0 {
-            let buf1 = &mut buf1[..min(buflen, remain)];
-            let buf2 = &mut buf2[..buf1.len()];
-
-            patch.read_exact(buf1)?;
-            older.read_exact(buf2)?;
-            for i in 0..buf1.len() {
-                buf1[i] = buf1[i].wrapping_add(buf2[i]);
-            }
-            output.write_all(buf1)?;
-
-            remain -= buf1.len();
-        }
-    }
-
-    let copy_len: usize = patch.read_varint()?;
-    {
-        let mut remain = copy_len;
-        while remain > 0 {
-            let buf = &mut buf1[..min(buflen, remain)];
-            patch.read_exact(buf)?;
-            output.write_all(buf)?;
-            remain -= buf.len();
-        }
-    }
-
-    let seek: i64 = patch.read_varint()?;
-    if seek != 0 {
-        older.seek(SeekFrom::Current(seek))?;
-    }
-
-    Ok(())
-}

@@ -5,3 +5,7 @@ members = [
     "crates/bipatch",
     "crates/bic"
 ]
+
+[profile.release]
+debug = true
+

@@ -1,7 +1,10 @@
 use brotli::Decompressor;
 use byteorder::{LittleEndian, ReadBytesExt};
 use integer_encoding::VarIntReader;
-use std::io::{self, Read, Seek};
+use std::{
+    cmp::min,
+    io::{self, ErrorKind, Read, Seek, SeekFrom},
+};
 use thiserror::Error;
 
 pub const MAGIC: u32 = 0xB1CC;
@@ -23,7 +26,7 @@ where
     R: Read,
     RS: Read + Seek,
 {
-    r: Decompressor<R>,
+    patch: Decompressor<R>,
     old: RS,
     state: ReaderState,
     buf: Vec<u8>,
@@ -44,17 +47,17 @@ where
     pub fn new(mut patch: R, old: RS) -> Result<Self, DecodeError> {
         let magic = patch.read_u32::<LittleEndian>()?;
         if magic != MAGIC {
-            Err(DecodeError::WrongMagic(magic))?;
+            return Err(DecodeError::WrongMagic(magic));
         }
 
         let version = patch.read_u32::<LittleEndian>()?;
         if version != VERSION {
-            Err(DecodeError::WrongMagic(version))?;
+            return Err(DecodeError::WrongMagic(version));
         }
 
-        let r = Decompressor::new(patch, BROTLI_BUFFER_SIZE);
+        let patch = Decompressor::new(patch, BROTLI_BUFFER_SIZE);
         Ok(Self {
-            r,
+            patch,
             old,
             state: ReaderState::Initial,
             buf: vec![0u8; 4096],
@@ -72,13 +75,59 @@ where
 
         while !buf.is_empty() {
             let processed = match self.state {
-                ReaderState::Initial => {
-                    let add_len: usize = self.r.read_varint()?;
-                    self.state = ReaderState::Add(add_len);
-                    0
+                ReaderState::Initial => match self.patch.read_varint() {
+                    Ok(add_len) => {
+                        self.state = ReaderState::Add(add_len);
+                        0
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::UnexpectedEof => {
+                            self.state = ReaderState::Final;
+                            0
+                        }
+                        _ => {
+                            return Err(e);
+                        }
+                    },
+                },
+                ReaderState::Add(add_len) => {
+                    let n = min(min(add_len, buf.len()), self.buf.len());
+
+                    let out = &mut buf[..n];
+                    self.old.read_exact(out)?;
+
+                    let dif = &mut self.buf[..n];
+                    self.patch.read_exact(dif)?;
+
+                    for i in 0..n {
+                        out[i] = out[i].wrapping_add(dif[i]);
+                    }
+
+                    if add_len == n {
+                        let copy_len: usize = self.patch.read_varint()?;
+                        self.state = ReaderState::Copy(copy_len)
+                    } else {
+                        self.state = ReaderState::Add(add_len - n);
+                    }
+
+                    n
                 }
-                ReaderState::Add(add_len) => 0,
-                ReaderState::Copy(copy_len) => 0,
+                ReaderState::Copy(copy_len) => {
+                    let n = min(copy_len, buf.len());
+
+                    let out = &mut buf[..n];
+                    self.patch.read_exact(out)?;
+
+                    if copy_len == n {
+                        let seek: i64 = self.patch.read_varint()?;
+                        self.old.seek(SeekFrom::Current(seek))?;
+                        self.state = ReaderState::Initial;
+                    } else {
+                        self.state = ReaderState::Copy(copy_len - n);
+                    }
+
+                    n
+                }
                 ReaderState::Final => {
                     break;
                 }
