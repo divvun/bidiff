@@ -15,8 +15,8 @@ where
 }
 
 pub struct WriterParams {
-    brotli_buffer_size: usize,
-    brotli_params: BrotliEncoderParams,
+    pub brotli_buffer_size: usize,
+    pub brotli_params: BrotliEncoderParams,
 }
 
 impl Default for WriterParams {
@@ -70,4 +70,3 @@ where
         self.w.into_inner()
     }
 }
-

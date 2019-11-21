@@ -3,13 +3,22 @@ use log::*;
 use size::Size;
 use std::{
     fs::{self, File},
-    io::{self, Read},
+    io::{self},
     path::Path,
     time::Instant,
 };
 
 struct Args {
     free: Vec<String>,
+    quality: i32,
+}
+
+impl Args {
+    fn writer_params(&self) -> bidiff::enc::WriterParams {
+        let mut params: bidiff::enc::WriterParams = Default::default();
+        params.brotli_params.quality = self.quality;
+        params
+    }
 }
 
 fn main() -> Fallible<()> {
@@ -18,8 +27,11 @@ fn main() -> Fallible<()> {
 
     env_logger::builder().init();
 
-    let args = pico_args::Arguments::from_env();
-    let args = Args { free: args.free()? };
+    let mut args = pico_args::Arguments::from_env();
+    let args = Args {
+        quality: args.opt_value_from_str(["--quality", "-q"])?.unwrap_or(9),
+        free: args.free()?,
+    };
 
     let cmd = args
         .free
@@ -35,7 +47,7 @@ fn main() -> Fallible<()> {
                 }
                 [&f[0], &f[1], &f[2]]
             };
-            do_diff(older, newer, patch)?;
+            do_diff(&args, older, newer, patch)?;
         }
         "patch" => {
             let [patch, older, output] = {
@@ -45,7 +57,7 @@ fn main() -> Fallible<()> {
                 }
                 [&f[0], &f[1], &f[2]]
             };
-            do_patch(patch, older, output)?;
+            do_patch(&args, patch, older, output)?;
         }
         "cycle" => {
             let [older, newer] = {
@@ -55,7 +67,7 @@ fn main() -> Fallible<()> {
                 }
                 [&f[0], &f[1]]
             };
-            do_cycle(older, newer)?;
+            do_cycle(&args, older, newer)?;
         }
         _ => return Err(err_msg("Usage: bic diff|patch|cycle")),
     }
@@ -63,7 +75,7 @@ fn main() -> Fallible<()> {
     Ok(())
 }
 
-fn do_cycle<O, N>(older: O, newer: N) -> Fallible<()>
+fn do_cycle<O, N>(args: &Args, older: O, newer: N) -> Fallible<()>
 where
     O: AsRef<Path>,
     N: AsRef<Path>,
@@ -80,7 +92,7 @@ where
 
     let mut patch = Vec::new();
     let before_diff = Instant::now();
-    bidiff::simple_diff(&older[..], &newer[..], &mut patch)?;
+    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.writer_params())?;
     println!("diffed in {:?}", before_diff.elapsed());
 
     let ratio = (patch.len() as f64) / (newer.len() as f64);
@@ -111,7 +123,7 @@ where
     Ok(())
 }
 
-fn do_patch<P, O, U>(patch: P, older: O, output: U) -> Fallible<()>
+fn do_patch<P, O, U>(_args: &Args, patch: P, older: O, output: U) -> Fallible<()>
 where
     P: AsRef<Path>,
     O: AsRef<Path>,
@@ -131,35 +143,19 @@ where
     Ok(())
 }
 
-fn do_diff<O, N, P>(older: O, newer: N, patch: P) -> Fallible<()>
+fn do_diff<O, N, P>(args: &Args, older: O, newer: N, patch: P) -> Fallible<()>
 where
     O: AsRef<Path>,
     N: AsRef<Path>,
     P: AsRef<Path>,
 {
     let start = Instant::now();
-    let mut older = File::open(older)?;
-    let mut newer = File::open(newer)?;
 
-    let mut obuf = Vec::new();
-    let mut nbuf = Vec::new();
+    let older = fs::read(older)?;
+    let newer = fs::read(newer)?;
+    let mut patch = File::create(patch)?;
 
-    older.read_to_end(&mut obuf)?;
-    newer.read_to_end(&mut nbuf)?;
-
-    let patch = File::create(patch)?;
-    let mut patch = bidiff::enc::Writer::new(patch)?;
-
-    let mut translator =
-        bidiff::Translator::new(&obuf[..], &nbuf[..], |control| patch.write(control));
-
-    bidiff::diff(&obuf[..], &nbuf[..], |m| -> Result<(), std::io::Error> {
-        translator.translate(m)?;
-        Ok(())
-    })?;
-
-    translator.close()?;
-    patch.flush()?;
+    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.writer_params())?;
 
     info!("Completed in {:?}", start.elapsed());
 

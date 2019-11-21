@@ -123,7 +123,25 @@ where
     info!("building suffix array...");
     let before_suffix = Instant::now();
     let sa = divsufsort::sort(&obuf[..]);
-    info!("sorting took {:?}", before_suffix.elapsed());
+    info!(
+        "sorting took {}",
+        DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
+    );
+
+    {
+        info!("trying parallel sort");
+        use rayon::prelude::*;
+        let before_parsuf = Instant::now();
+        let sas: Vec<_> = obuf
+            .par_chunks(obuf.len() / 4 + 1)
+            .map(divsufsort::sort)
+            .collect();
+        info!(
+            "had {} partitions, took {}",
+            sas.len(),
+            DurationSpeed(obuf.len() as u64, before_parsuf.elapsed())
+        );
+    }
 
     let before_scan = Instant::now();
     info!("scanning...");
@@ -270,14 +288,64 @@ where
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
     }
-    info!("scan took {:?}", before_scan.elapsed());
+    info!(
+        "scanning took {}",
+        DurationSpeed(nbuf.len() as u64, before_scan.elapsed())
+    );
 
     Ok(())
 }
 
+use std::fmt;
+
+struct DurationSpeed(u64, std::time::Duration);
+
+impl fmt::Display for DurationSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let (size, duration) = (self.0, self.1);
+        write!(f, "{:?} ({})", duration, Speed(size.into(), duration))
+    }
+}
+
+struct Speed(u64, std::time::Duration);
+
+impl fmt::Display for Speed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let (size, duration) = (self.0, self.1);
+        let per_sec = size as f64 / duration.as_secs_f64();
+        write!(f, "{} / s", Size(per_sec as u64))
+    }
+}
+
+struct Size(u64);
+
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let x = self.0;
+
+        if x > 1024 * 1024 {
+            write!(f, "{:.2} MiB", x as f64 / (1024.0 * 1024.0))
+        } else if x > 1024 {
+            write!(f, "{:.1} KiB", x as f64 / (1024.0))
+        } else {
+            write!(f, "{} B", x)
+        }
+    }
+}
+
 #[cfg(feature = "enc")]
 pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
-    let mut w = enc::Writer::new(out)?;
+    simple_diff_with_params(older, newer, out, &Default::default())
+}
+
+#[cfg(feature = "enc")]
+pub fn simple_diff_with_params(
+    older: &[u8],
+    newer: &[u8],
+    out: &mut dyn Write,
+    params: &enc::WriterParams,
+) -> Result<(), io::Error> {
+    let mut w = enc::Writer::with_params(out, params)?;
 
     let mut translator = Translator::new(older, newer, |control| w.write(control));
     diff(older, newer, |m| translator.translate(m))?;
@@ -285,4 +353,3 @@ pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<()
 
     Ok(())
 }
-
