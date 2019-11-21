@@ -1,5 +1,6 @@
 use log::*;
 use std::{
+    cmp::min,
     io::{self, Write},
     time::Instant,
 };
@@ -112,6 +113,177 @@ where
     }
 }
 
+struct BsdiffIterator<'a> {
+    scan: usize,
+    pos: usize,
+    length: usize,
+    lastscan: usize,
+    lastpos: usize,
+    lastoffset: isize,
+
+    obuf: &'a [u8],
+    nbuf: &'a [u8],
+    sa: &'a sacabase::SuffixArray<'a, i32>,
+}
+
+impl<'a> BsdiffIterator<'a> {
+    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a sacabase::SuffixArray<'a, i32>) -> Self {
+        Self {
+            scan: 0,
+            pos: 0,
+            length: 0,
+            lastscan: 0,
+            lastpos: 0,
+            lastoffset: 0,
+            obuf,
+            nbuf,
+            sa,
+        }
+    }
+}
+
+impl<'a> Iterator for BsdiffIterator<'a> {
+    type Item = Match;
+    fn next(&mut self) -> Option<Self::Item> {
+        let obuflen = self.obuf.len();
+        let nbuflen = self.nbuf.len();
+
+        'outer: while self.scan < nbuflen {
+            let mut oldscore = 0_usize;
+            self.scan += self.length;
+
+            let mut scsc = self.scan;
+            'inner: while self.scan < nbuflen {
+                let res = self.sa.longest_substring_match(&self.nbuf[self.scan..]);
+                self.pos = res.start();
+                self.length = res.len();
+
+                {
+                    while scsc < self.scan + self.length {
+                        let oi = (scsc as isize + self.lastoffset) as usize;
+                        if oi < obuflen && self.obuf[oi] == self.nbuf[scsc] {
+                            oldscore += 1;
+                        }
+                        scsc += 1;
+                    }
+                }
+
+                let significantly_better = self.length > oldscore + 8;
+                let same_length = self.length == oldscore && self.length != 0;
+
+                if same_length || significantly_better {
+                    break 'inner;
+                }
+
+                {
+                    let oi = (self.scan as isize + self.lastoffset) as usize;
+                    if oi < obuflen && self.obuf[oi] == self.nbuf[self.scan] {
+                        oldscore -= 1;
+                    }
+                }
+
+                self.scan += 1;
+            } // 'inner
+
+            let done_scanning = self.scan == nbuflen;
+            if self.length != oldscore || done_scanning {
+                // length forward from lastscan
+                let mut lenf = {
+                    let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
+
+                    for i in 0..min(self.scan - self.lastscan, obuflen - self.lastpos) {
+                        if self.obuf[self.lastpos + i] == self.nbuf[self.lastscan + i] {
+                            s += 1;
+                        }
+
+                        {
+                            // the original code has an `i++` in the
+                            // middle of what's essentially a while loop.
+                            let i = i + 1;
+                            if s * 2 - i as isize > sf * 2 - lenf {
+                                sf = s;
+                                lenf = i as isize;
+                            }
+                        }
+                    }
+                    lenf as usize
+                };
+
+                // length backwards from scan
+                let mut lenb = {
+                    let (mut s, mut sb, mut lenb) = (0_isize, 0_isize, 0_isize);
+
+                    for i in 1..min(self.scan - self.lastscan + 1, self.pos + 1) {
+                        if self.obuf[self.pos - i] == self.nbuf[self.scan - i] {
+                            s += 1;
+                        }
+
+                        if (s * 2 - i as isize) > (sb * 2 - lenb) {
+                            sb = s;
+                            lenb = i as isize;
+                        }
+                    }
+                    lenb as usize
+                };
+
+                let lastscan_was_better = self.lastscan + lenf > self.scan - lenb;
+                if lastscan_was_better {
+                    // if our last scan went forward more than
+                    // our current scan went back, figure out how much
+                    // of our current scan to crop based on scoring
+                    let overlap = (self.lastscan + lenf) - (self.scan - lenb);
+
+                    let lens = {
+                        let (mut s, mut ss, mut lens) = (0, 0, 0);
+                        for i in 0..overlap {
+                            if self.nbuf[self.lastscan + lenf - overlap + i]
+                                == self.obuf[self.lastpos + lenf - overlap + i]
+                            {
+                                // point to last scan
+                                s += 1;
+                            }
+                            if self.nbuf[self.scan - lenb + i] == self.obuf[self.pos - lenb + i] {
+                                // point to current scan
+                                s -= 1;
+                            }
+
+                            // new high score for last scan?
+                            if s > ss {
+                                ss = s;
+                                lens = i + 1;
+                            }
+                        }
+                        lens
+                    };
+
+                    // order matters to avoid overflow
+                    lenf += lens;
+                    lenf -= overlap;
+
+                    lenb -= lens;
+                } // lastscan was better
+
+                let res = Match {
+                    add_old_start: self.lastpos,
+                    add_new_start: self.lastscan,
+                    add_length: lenf,
+                    copy_end: self.scan - lenb,
+                };
+
+                if !done_scanning {
+                    self.lastscan = self.scan - lenb;
+                    self.lastpos = self.pos - lenb;
+                    self.lastoffset = self.pos as isize - self.scan as isize;
+                }
+
+                return Some(res);
+            } // interesting score, or done scanning
+        } // 'outer - done scanning for good
+
+        None
+    }
+}
+
 /// Diff two files
 pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], mut on_match: F) -> Result<(), E>
 where
@@ -143,11 +315,24 @@ where
         );
     }
 
+    {
+        info!("trying parallel scan");
+        use rayon::prelude::*;
+        let before_parscan = Instant::now();
+        let matches: Vec<Vec<Match>> = nbuf
+            .par_chunks(nbuf.len() / 12 + 1)
+            .map(|nbuf| BsdiffIterator::new(obuf, nbuf, &sa).collect::<Vec<_>>())
+            .collect();
+        info!(
+            "had {} partitions, took {}",
+            matches.len(),
+            DurationSpeed(obuf.len() as u64, before_parscan.elapsed())
+        );
+    }
+
     let before_scan = Instant::now();
     info!("scanning...");
     {
-        use std::cmp::min;
-
         let mut scan = 0_usize;
         let mut pos = 0_usize;
         let mut length = 0_usize;
