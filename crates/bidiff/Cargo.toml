@@ -21,3 +21,6 @@ sacapart = "2.0.0"
 divsufsort = "2.0.0"
 rayon = "1.2.1"
 
+[dev-dependencies]
+proptest = "0.9.4"
+

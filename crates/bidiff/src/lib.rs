@@ -423,3 +423,85 @@ pub fn simple_diff_with_params(
 
     Ok(())
 }
+
+pub fn assert_cycle(older: &[u8], newer: &[u8]) {
+    let mut older_pos = 0_usize;
+    let mut newer_pos = 0_usize;
+
+    let mut translator = Translator::new(older, newer, |control| -> Result<(), std::io::Error> {
+        // println!("got control {:?}", control);
+
+        for &ab in control.add {
+            let fb = ab.wrapping_add(older[older_pos]);
+            older_pos += 1;
+
+            let nb = newer[newer_pos];
+            newer_pos += 1;
+
+            assert_eq!(fb, nb);
+        }
+
+        for &cb in control.copy {
+            let nb = newer[newer_pos];
+            newer_pos += 1;
+
+            assert_eq!(cb, nb);
+        }
+
+        older_pos = (older_pos as i64 + control.seek) as usize;
+
+        Ok(())
+    });
+
+    diff(older, newer, &Default::default(), |m| {
+        translator.translate(m)
+    })
+    .unwrap();
+
+    translator.close().unwrap();
+
+    assert_eq!(newer_pos, newer.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    fn apply_instructions(older: &[u8], instructions: &[u8]) -> Vec<u8> {
+        use std::cmp::min;
+        let mut newer: Vec<_> = older.iter().map(|x| *x).collect();
+
+        for couple in instructions.chunks(2) {
+            let (i, j) = (couple[0], couple[1]);
+
+            if i < 128 {
+                let pos = (i as usize) % newer.len();
+                let len = j as usize;
+                let data: Vec<u8> = (&newer[pos..min(pos + len, newer.len())])
+                    .iter()
+                    .map(|x| *x)
+                    .collect();
+                for c in data {
+                    newer.push(c);
+                }
+            } else if i < 150 {
+                for _ in 0..(i - 128) {
+                    newer.push(j);
+                }
+            } else {
+                let a = (j as usize) % newer.len();
+                let b = (a + 1) % newer.len();
+                newer.swap(a, b);
+            }
+        }
+        newer
+    }
+
+    proptest! {
+        #[test]
+        fn cycle(older: [u8; 32], instructions: [u8; 32]) {
+            let newer = apply_instructions(&older[..], &instructions[..]);
+            super::assert_cycle(&older[..], &newer[..]);
+        }
+    }
+}
