@@ -1,4 +1,7 @@
 use log::*;
+use rayon::prelude::*;
+use sacabase::StringIndex;
+use sacapart::PartitionedSuffixArray;
 use std::{
     cmp::min,
     io::{self, Write},
@@ -123,11 +126,11 @@ struct BsdiffIterator<'a> {
 
     obuf: &'a [u8],
     nbuf: &'a [u8],
-    sa: &'a sacabase::SuffixArray<'a, i32>,
+    sa: &'a dyn StringIndex<'a>,
 }
 
 impl<'a> BsdiffIterator<'a> {
-    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a sacabase::SuffixArray<'a, i32>) -> Self {
+    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a dyn StringIndex<'a>) -> Self {
         Self {
             scan: 0,
             pos: 0,
@@ -155,8 +158,8 @@ impl<'a> Iterator for BsdiffIterator<'a> {
             let mut scsc = self.scan;
             'inner: while self.scan < nbuflen {
                 let res = self.sa.longest_substring_match(&self.nbuf[self.scan..]);
-                self.pos = res.start();
-                self.length = res.len();
+                self.pos = res.start;
+                self.length = res.len;
 
                 {
                     while scsc < self.scan + self.length {
@@ -284,226 +287,79 @@ impl<'a> Iterator for BsdiffIterator<'a> {
     }
 }
 
+pub struct DiffParams {
+    // Number of partitions to use for suffix sorting.
+    // Increase this number increases parallelism but produces slightly worse patches.
+    pub sort_partitions: usize,
+
+    // Size of chunks to use for scanning. When None, treat the
+    // input as a single chunk. Smaller chunks increase parallelism but
+    // produce slightly worse patches.
+    pub scan_chunk_size: Option<usize>,
+}
+
+impl Default for DiffParams {
+    fn default() -> Self {
+        Self {
+            sort_partitions: 1,
+            scan_chunk_size: None,
+        }
+    }
+}
+
 /// Diff two files
-pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], mut on_match: F) -> Result<(), E>
+pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], params: &DiffParams, mut on_match: F) -> Result<(), E>
 where
     F: FnMut(Match) -> Result<(), E>,
 {
-    let obuflen = obuf.len();
-    let nbuflen = nbuf.len();
-
     info!("building suffix array...");
     let before_suffix = Instant::now();
-    let sa = divsufsort::sort(&obuf[..]);
+    let sa = PartitionedSuffixArray::new(&obuf[..], params.sort_partitions, divsufsort::sort);
     info!(
         "sorting took {}",
         DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
     );
 
-    {
-        info!("trying parallel sort");
-        use rayon::prelude::*;
-        let before_parsuf = Instant::now();
-        let num_partitions = 4;
-        let sas: Vec<_> = obuf
-            .par_chunks(obuf.len() / num_partitions + 1)
-            .map(divsufsort::sort)
-            .collect();
-        info!(
-            "had {} partitions, took {}",
-            sas.len(),
-            DurationSpeed(obuf.len() as u64, before_parsuf.elapsed())
-        );
-    }
+    // +1 to make sure we don't have > num_partitions
+    let chunk_size = params.scan_chunk_size.unwrap_or(nbuf.len());
+    let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
 
-    {
-        info!("trying parallel scan");
-        use rayon::prelude::*;
-        let before_parscan = Instant::now();
+    info!(
+        "scanning with {}B chunks... ({} chunks total)",
+        chunk_size, num_chunks
+    );
 
-        // +1 to make sure we don't have > num_partitions
-        let chunk_size = 128 * 1024;
-        let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
-
-        let mut txs = Vec::new();
-        let mut rxs = Vec::new();
-        for _ in 0..num_chunks {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
-            txs.push(tx);
-            rxs.push(rx);
-        }
-
-        nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-            let iter = BsdiffIterator::new(obuf, nbuf, &sa);
-            tx.send(iter.collect()).expect("should send results");
-        });
-
-        for (i, rx) in rxs.into_iter().enumerate() {
-            let offset = i * chunk_size;
-            let v = rx.recv().expect("should receive results");
-            for mut m in v {
-                if m.add_length == 0 && m.copy_end == m.copy_start() {
-                    continue;
-                }
-
-                m.add_new_start += offset;
-                m.copy_end += offset;
-            }
-        }
-
-        info!(
-            "had {} partitions, took {}",
-            num_chunks,
-            DurationSpeed(obuf.len() as u64, before_parscan.elapsed())
-        );
+    let mut txs = Vec::new();
+    let mut rxs = Vec::new();
+    for _ in 0..num_chunks {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
+        txs.push(tx);
+        rxs.push(rx);
     }
 
     let before_scan = Instant::now();
-    info!("scanning...");
-    {
-        let mut scan = 0_usize;
-        let mut pos = 0_usize;
-        let mut length = 0_usize;
-        let mut lastscan = 0_usize;
-        let mut lastpos = 0_usize;
+    nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
+        let iter = BsdiffIterator::new(obuf, nbuf, &sa);
+        tx.send(iter.collect()).expect("should send results");
+    });
 
-        let mut lastoffset = 0_isize;
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let offset = i * chunk_size;
+        let v = rx.recv().expect("should receive results");
+        for mut m in v {
+            if m.add_length == 0 && m.copy_end == m.copy_start() {
+                continue;
+            }
 
-        'outer: while scan < nbuflen {
-            let mut oldscore = 0_usize;
-            scan += length;
-
-            let mut scsc = scan;
-            'inner: while scan < nbuflen {
-                let res = sa.longest_substring_match(&nbuf[scan..]);
-                pos = res.start();
-                length = res.len();
-
-                {
-                    while scsc < scan + length {
-                        let oi = (scsc as isize + lastoffset) as usize;
-                        if oi < obuflen && obuf[oi] == nbuf[scsc] {
-                            oldscore += 1;
-                        }
-                        scsc += 1;
-                    }
-                }
-
-                let significantly_better = length > oldscore + 8;
-                let same_length = length == oldscore && length != 0;
-
-                if same_length || significantly_better {
-                    break 'inner;
-                }
-
-                {
-                    let oi = (scan as isize + lastoffset) as usize;
-                    if oi < obuflen && obuf[oi] == nbuf[scan] {
-                        oldscore -= 1;
-                    }
-                }
-
-                scan += 1;
-            } // 'inner
-
-            let done_scanning = scan == nbuflen;
-            if length != oldscore || done_scanning {
-                // length forward from lastscan
-                let mut lenf = {
-                    let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
-
-                    for i in 0..min(scan - lastscan, obuflen - lastpos) {
-                        if obuf[lastpos + i] == nbuf[lastscan + i] {
-                            s += 1;
-                        }
-
-                        {
-                            // the original code has an `i++` in the
-                            // middle of what's essentially a while loop.
-                            let i = i + 1;
-                            if s * 2 - i as isize > sf * 2 - lenf {
-                                sf = s;
-                                lenf = i as isize;
-                            }
-                        }
-                    }
-                    lenf as usize
-                };
-
-                // length backwards from scan
-                let mut lenb = {
-                    let (mut s, mut sb, mut lenb) = (0_isize, 0_isize, 0_isize);
-
-                    for i in 1..min(scan - lastscan + 1, pos + 1) {
-                        if obuf[pos - i] == nbuf[scan - i] {
-                            s += 1;
-                        }
-
-                        if (s * 2 - i as isize) > (sb * 2 - lenb) {
-                            sb = s;
-                            lenb = i as isize;
-                        }
-                    }
-                    lenb as usize
-                };
-
-                let lastscan_was_better = lastscan + lenf > scan - lenb;
-                if lastscan_was_better {
-                    // if our last scan went forward more than
-                    // our current scan went back, figure out how much
-                    // of our current scan to crop based on scoring
-                    let overlap = (lastscan + lenf) - (scan - lenb);
-
-                    let lens = {
-                        let (mut s, mut ss, mut lens) = (0, 0, 0);
-                        for i in 0..overlap {
-                            if nbuf[lastscan + lenf - overlap + i]
-                                == obuf[lastpos + lenf - overlap + i]
-                            {
-                                // point to last scan
-                                s += 1;
-                            }
-                            if nbuf[scan - lenb + i] == obuf[pos - lenb + i] {
-                                // point to current scan
-                                s -= 1;
-                            }
-
-                            // new high score for last scan?
-                            if s > ss {
-                                ss = s;
-                                lens = i + 1;
-                            }
-                        }
-                        lens
-                    };
-
-                    // order matters to avoid overflow
-                    lenf += lens;
-                    lenf -= overlap;
-
-                    lenb -= lens;
-                } // lastscan was better
-
-                on_match(Match {
-                    add_old_start: lastpos,
-                    add_new_start: lastscan,
-                    add_length: lenf,
-                    copy_end: scan - lenb,
-                })?;
-
-                if done_scanning {
-                    break 'outer;
-                }
-
-                lastscan = scan - lenb;
-                lastpos = pos - lenb;
-                lastoffset = pos as isize - scan as isize;
-            } // interesting score, or done scanning
-        } // 'outer - done scanning for good
+            m.add_new_start += offset;
+            m.copy_end += offset;
+            on_match(m)?;
+        }
     }
+
     info!(
         "scanning took {}",
-        DurationSpeed(nbuf.len() as u64, before_scan.elapsed())
+        DurationSpeed(obuf.len() as u64, before_scan.elapsed())
     );
 
     Ok(())
@@ -548,7 +404,7 @@ impl fmt::Display for Size {
 
 #[cfg(feature = "enc")]
 pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
-    simple_diff_with_params(older, newer, out, &Default::default())
+    simple_diff_with_params(older, newer, out, &Default::default(), &Default::default())
 }
 
 #[cfg(feature = "enc")]
@@ -556,12 +412,13 @@ pub fn simple_diff_with_params(
     older: &[u8],
     newer: &[u8],
     out: &mut dyn Write,
-    params: &enc::WriterParams,
+    diff_params: &DiffParams,
+    writer_params: &enc::WriterParams,
 ) -> Result<(), io::Error> {
-    let mut w = enc::Writer::with_params(out, params)?;
+    let mut w = enc::Writer::with_params(out, writer_params)?;
 
     let mut translator = Translator::new(older, newer, |control| w.write(control));
-    diff(older, newer, |m| translator.translate(m))?;
+    diff(older, newer, diff_params, |m| translator.translate(m))?;
     translator.close()?;
 
     Ok(())

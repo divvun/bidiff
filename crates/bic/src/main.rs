@@ -11,6 +11,8 @@ use std::{
 struct Args {
     free: Vec<String>,
     quality: i32,
+    partitions: usize,
+    chunk_size: Option<usize>,
 }
 
 impl Args {
@@ -18,6 +20,13 @@ impl Args {
         let mut params: bidiff::enc::WriterParams = Default::default();
         params.brotli_params.quality = self.quality;
         params
+    }
+
+    fn diff_params(&self) -> bidiff::DiffParams {
+        bidiff::DiffParams {
+            sort_partitions: self.partitions,
+            scan_chunk_size: self.chunk_size,
+        }
     }
 }
 
@@ -30,6 +39,8 @@ fn main() -> Fallible<()> {
     let mut args = pico_args::Arguments::from_env();
     let args = Args {
         quality: args.opt_value_from_str(["--quality", "-q"])?.unwrap_or(9),
+        partitions: args.opt_value_from_str("--partitions")?.unwrap_or(1),
+        chunk_size: args.opt_value_from_str("--chunk-size")?,
         free: args.free()?,
     };
 
@@ -92,7 +103,13 @@ where
 
     let mut patch = Vec::new();
     let before_diff = Instant::now();
-    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.writer_params())?;
+    bidiff::simple_diff_with_params(
+        &older[..],
+        &newer[..],
+        &mut patch,
+        &args.diff_params(),
+        &args.writer_params(),
+    )?;
     println!("diffed in {:?}", before_diff.elapsed());
 
     let ratio = (patch.len() as f64) / (newer.len() as f64);
@@ -155,7 +172,13 @@ where
     let newer = fs::read(newer)?;
     let mut patch = File::create(patch)?;
 
-    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.writer_params())?;
+    bidiff::simple_diff_with_params(
+        &older[..],
+        &newer[..],
+        &mut patch,
+        &args.diff_params(),
+        &args.writer_params(),
+    )?;
 
     info!("Completed in {:?}", start.elapsed());
 
