@@ -304,8 +304,9 @@ where
         info!("trying parallel sort");
         use rayon::prelude::*;
         let before_parsuf = Instant::now();
+        let num_partitions = 4;
         let sas: Vec<_> = obuf
-            .par_chunks(obuf.len() / 4 + 1)
+            .par_chunks(obuf.len() / num_partitions + 1)
             .map(divsufsort::sort)
             .collect();
         info!(
@@ -319,13 +320,40 @@ where
         info!("trying parallel scan");
         use rayon::prelude::*;
         let before_parscan = Instant::now();
-        let matches: Vec<Vec<Match>> = nbuf
-            .par_chunks(nbuf.len() / 12 + 1)
-            .map(|nbuf| BsdiffIterator::new(obuf, nbuf, &sa).collect::<Vec<_>>())
-            .collect();
+
+        // +1 to make sure we don't have > num_partitions
+        let chunk_size = 128 * 1024;
+        let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
+
+        let mut txs = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..num_chunks {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
+            txs.push(tx);
+            rxs.push(rx);
+        }
+
+        nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
+            let iter = BsdiffIterator::new(obuf, nbuf, &sa);
+            tx.send(iter.collect()).expect("should send results");
+        });
+
+        for (i, rx) in rxs.into_iter().enumerate() {
+            let offset = i * chunk_size;
+            let v = rx.recv().expect("should receive results");
+            for mut m in v {
+                if m.add_length == 0 && m.copy_end == m.copy_start() {
+                    continue;
+                }
+
+                m.add_new_start += offset;
+                m.copy_end += offset;
+            }
+        }
+
         info!(
             "had {} partitions, took {}",
-            matches.len(),
+            num_chunks,
             DurationSpeed(obuf.len() as u64, before_parscan.elapsed())
         );
     }
