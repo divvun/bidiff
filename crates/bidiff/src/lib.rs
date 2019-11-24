@@ -11,7 +11,7 @@ use std::{
 #[cfg(feature = "enc")]
 pub mod enc;
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, feature = "instructions"))]
 pub mod instructions;
 
 #[derive(Debug)]

@@ -7,6 +7,7 @@ edition = "2018"
 [features]
 default = ["enc"]
 enc = ["byteorder", "integer-encoding"]
+instructions = []
 
 [dependencies]
 # for enc
