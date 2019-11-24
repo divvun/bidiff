@@ -97,7 +97,6 @@ where
 
     fn do_close(&mut self) -> Result<(), E> {
         if !self.closed {
-            println!("Sending none");
             self.send_control(None)?;
             self.closed = true;
         }
@@ -149,8 +148,6 @@ impl<'a> BsdiffIterator<'a> {
 impl<'a> Iterator for BsdiffIterator<'a> {
     type Item = Match;
     fn next(&mut self) -> Option<Self::Item> {
-        println!("------------------------");
-
         let obuflen = self.obuf.len();
         let nbuflen = self.nbuf.len();
 
@@ -178,7 +175,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 let same_length = self.length == oldscore && self.length != 0;
 
                 if same_length || significantly_better {
-                    println!("break");
                     break 'inner;
                 }
 
@@ -193,10 +189,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
             } // 'inner
 
             let done_scanning = self.scan == nbuflen;
-            println!(
-                "length={} oldscore={} scan={} buflen={}",
-                self.length, oldscore, self.scan, nbuflen
-            );
             if self.length != oldscore || done_scanning {
                 // length forward from lastscan
                 let mut lenf = {
@@ -219,7 +211,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     }
                     lenf as usize
                 };
-                println!("lenf={}", lenf);
 
                 // length backwards from scan
                 let mut lenb = if self.scan >= nbuflen {
@@ -239,7 +230,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     }
                     lenb as usize
                 };
-                println!("lenb={}", lenb);
 
                 let lastscan_was_better = self.lastscan + lenf > self.scan - lenb;
                 if lastscan_was_better {
@@ -247,7 +237,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     // our current scan went back, figure out how much
                     // of our current scan to crop based on scoring
                     let overlap = (self.lastscan + lenf) - (self.scan - lenb);
-                    println!("overlap={}", overlap);
 
                     let lens = {
                         let (mut s, mut ss, mut lens) = (0, 0, 0);
@@ -289,41 +278,9 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 self.lastpos = self.pos - lenb;
                 self.lastoffset = self.pos as isize - self.scan as isize;
 
-                println!(
-                    "=> aos={} ans={} al={} ce={}",
-                    m.add_old_start, m.add_new_start, m.add_length, m.copy_end
-                );
-                println!("lastoffset={}", self.lastoffset);
-
                 return Some(m);
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
-        println!("broke out of for");
-
-        if self.lastscan < self.scan {
-            println!(
-                "about to return None, but lastscan {} < scan {}",
-                self.lastscan, self.scan
-            );
-
-            println!("lastpos = {}", self.lastpos);
-            println!("lastoffset = {}", self.lastoffset);
-            println!("length = {}", self.length);
-
-            println!(
-                "to be precise we have nbuf left: {:?}",
-                &self.nbuf[self.lastscan..]
-            );
-
-            let m = Match {
-                add_old_start: self.lastpos,
-                add_new_start: self.lastscan,
-                add_length: 0,
-                copy_end: self.scan,
-            };
-            self.lastscan = self.scan;
-            return Some(m);
-        }
 
         None
     }
@@ -558,10 +515,6 @@ mod tests {
         ];
         let newer = apply_instructions(&older[..], &instructions[..]);
 
-        println!("older = {:?}", older);
-        println!("newer = {:?}", newer);
-        std::fs::write("older.testinput", &older[..]).unwrap();
-        std::fs::write("newer.testinput", &newer[..]).unwrap();
         super::assert_cycle(&older[..], &newer[..]);
     }
 

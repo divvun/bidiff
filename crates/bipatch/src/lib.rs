@@ -7,7 +7,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const MAGIC: u32 = 0xB1CC;
+pub const MAGIC: u32 = 0xB1DF;
 pub const VERSION: u32 = 0x1000;
 const BROTLI_BUFFER_SIZE: usize = 4096;
 
@@ -15,9 +15,9 @@ const BROTLI_BUFFER_SIZE: usize = 4096;
 pub enum DecodeError {
     #[error("I/O error")]
     IO(#[from] io::Error),
-    #[error("wrong magic: expected B1CC, got `{0:X}`")]
+    #[error("wrong magic: expected `{:X}`, got `{0:X}`", MAGIC)]
     WrongMagic(u32),
-    #[error("wrong magic: expected 1000, got `{0:X}`")]
+    #[error("wrong magic: expected `{:X}`, got `{0:X}`", VERSION)]
     WrongVersion(u32),
 }
 
