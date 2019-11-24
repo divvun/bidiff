@@ -78,6 +78,7 @@ where
     }
 
     pub fn translate(&mut self, m: Match) -> Result<(), E> {
+        println!("{:?}", m);
         self.send_control(Some(&m))?;
 
         self.buf.clear();
@@ -97,6 +98,7 @@ where
 
     fn do_close(&mut self) -> Result<(), E> {
         if !self.closed {
+            println!("Sending none");
             self.send_control(None)?;
             self.closed = true;
         }
@@ -148,6 +150,8 @@ impl<'a> BsdiffIterator<'a> {
 impl<'a> Iterator for BsdiffIterator<'a> {
     type Item = Match;
     fn next(&mut self) -> Option<Self::Item> {
+        println!("------------------------");
+
         let obuflen = self.obuf.len();
         let nbuflen = self.nbuf.len();
 
@@ -189,9 +193,14 @@ impl<'a> Iterator for BsdiffIterator<'a> {
             } // 'inner
 
             let done_scanning = self.scan == nbuflen;
+            println!("done scanning? {}", done_scanning);
             if self.length != oldscore || done_scanning {
                 // length forward from lastscan
                 let mut lenf = {
+                    println!(
+                        "computing lenf, match pos = {}, length = {}",
+                        self.pos, self.length
+                    );
                     let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
 
                     for i in 0..min(self.scan - self.lastscan, obuflen - self.lastpos) {
@@ -216,7 +225,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 let mut lenb = {
                     let (mut s, mut sb, mut lenb) = (0_isize, 0_isize, 0_isize);
 
-                    for i in 1..min(self.scan - self.lastscan + 1, self.pos + 1) {
+                    for i in 1..=min(self.scan - self.lastscan, self.pos) {
                         if self.obuf[self.pos - i] == self.nbuf[self.scan - i] {
                             s += 1;
                         }
@@ -228,6 +237,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     }
                     lenb as usize
                 };
+                println!("lenf {}, lenb {}", lenf, lenb);
 
                 let lastscan_was_better = self.lastscan + lenf > self.scan - lenb;
                 if lastscan_was_better {
@@ -235,6 +245,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     // our current scan went back, figure out how much
                     // of our current scan to crop based on scoring
                     let overlap = (self.lastscan + lenf) - (self.scan - lenb);
+                    println!("overlap = {}", overlap);
 
                     let lens = {
                         let (mut s, mut ss, mut lens) = (0, 0, 0);
@@ -242,30 +253,47 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                             if self.nbuf[self.lastscan + lenf - overlap + i]
                                 == self.obuf[self.lastpos + lenf - overlap + i]
                             {
-                                // point to last scan
+                                // point goes to last scan
                                 s += 1;
+                                println!("point for lastscan, s = {}", s);
                             }
                             if self.nbuf[self.scan - lenb + i] == self.obuf[self.pos - lenb + i] {
-                                // point to current scan
+                                // point goes to current scan
                                 s -= 1;
+                                println!("point for currentscan, s = {}", s);
                             }
 
                             // new high score for last scan?
                             if s > ss {
+                                println!("new high score, s {} > ss {}", s, ss);
                                 ss = s;
                                 lens = i + 1;
+                                println!("new lens = {}", lens);
                             }
                         }
                         lens
                     };
+                    println!("lens = {}", lens);
 
                     // order matters to avoid overflow
+                    println!("lenf still {}", lenf);
+                    println!("lens - overlap =  {}", lens as isize - overlap as isize);
+                    println!(
+                        "lenf + (lens - overlap) {}",
+                        lenf as isize + (lens as isize - overlap as isize)
+                    );
                     lenf += lens;
                     lenf -= overlap;
 
                     lenb -= lens;
+                    println!("after scoring, lenf = {}, lenb = {}", lenf, lenb);
                 } // lastscan was better
 
+                let copy_len = (self.scan - lenb) - (self.lastscan + lenf);
+                println!(
+                    "scan = {}/{}, lastscan = {} adding {}, copying {}",
+                    self.scan, nbuflen, self.lastscan, lenf, copy_len
+                );
                 let res = Match {
                     add_old_start: self.lastpos,
                     add_new_start: self.lastscan,
@@ -273,15 +301,38 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     copy_end: self.scan - lenb,
                 };
 
-                if !done_scanning {
-                    self.lastscan = self.scan - lenb;
-                    self.lastpos = self.pos - lenb;
-                    self.lastoffset = self.pos as isize - self.scan as isize;
-                }
+                self.lastscan = self.scan - lenb;
+                self.lastpos = self.pos - lenb;
+                self.lastoffset = self.pos as isize - self.scan as isize;
 
                 return Some(res);
             } // interesting score, or done scanning
         } // 'outer - done scanning for good
+
+        if self.lastscan < self.scan {
+            println!(
+                "about to return None, but lastscan {} < scan {}",
+                self.lastscan, self.scan
+            );
+
+            println!("lastpos = {}", self.lastpos);
+            println!("lastoffset = {}", self.lastoffset);
+            println!("length = {}", self.length);
+
+            println!(
+                "to be precise we have nbuf left: {:?}",
+                &self.nbuf[self.lastscan..]
+            );
+
+            let res = Match {
+                add_old_start: self.lastpos,
+                add_new_start: self.lastscan,
+                add_length: 0,
+                copy_end: self.scan,
+            };
+            self.lastscan = self.scan;
+            return Some(res);
+        }
 
         None
     }
@@ -320,40 +371,45 @@ where
         DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
     );
 
-    // +1 to make sure we don't have > num_partitions
-    let chunk_size = params.scan_chunk_size.unwrap_or(nbuf.len());
-    let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
-
-    info!(
-        "scanning with {}B chunks... ({} chunks total)",
-        chunk_size, num_chunks
-    );
-
-    let mut txs = Vec::new();
-    let mut rxs = Vec::new();
-    for _ in 0..num_chunks {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
-        txs.push(tx);
-        rxs.push(rx);
-    }
-
     let before_scan = Instant::now();
-    nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-        let iter = BsdiffIterator::new(obuf, nbuf, &sa);
-        tx.send(iter.collect()).expect("should send results");
-    });
+    if let Some(chunk_size) = params.scan_chunk_size {
+        // +1 to make sure we don't have > num_partitions
+        let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
 
-    for (i, rx) in rxs.into_iter().enumerate() {
-        let offset = i * chunk_size;
-        let v = rx.recv().expect("should receive results");
-        for mut m in v {
-            if m.add_length == 0 && m.copy_end == m.copy_start() {
-                continue;
+        info!(
+            "scanning with {}B chunks... ({} chunks total)",
+            chunk_size, num_chunks
+        );
+
+        let mut txs = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..num_chunks {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
+            txs.push(tx);
+            rxs.push(rx);
+        }
+
+        nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
+            let iter = BsdiffIterator::new(obuf, nbuf, &sa);
+            tx.send(iter.collect()).expect("should send results");
+        });
+
+        for (i, rx) in rxs.into_iter().enumerate() {
+            let offset = i * chunk_size;
+            let v = rx.recv().expect("should receive results");
+            for mut m in v {
+                // if m.add_length == 0 && m.copy_end == m.copy_start() {
+                //     continue;
+                // }
+
+                m.add_new_start += offset;
+                m.copy_end += offset;
+                on_match(m)?;
             }
-
-            m.add_new_start += offset;
-            m.copy_end += offset;
-            on_match(m)?;
+        }
+    } else {
+        for m in BsdiffIterator::new(obuf, nbuf, &sa) {
+            on_match(m)?
         }
     }
 
@@ -429,7 +485,7 @@ pub fn assert_cycle(older: &[u8], newer: &[u8]) {
     let mut newer_pos = 0_usize;
 
     let mut translator = Translator::new(older, newer, |control| -> Result<(), std::io::Error> {
-        // println!("got control {:?}", control);
+        println!("{:?}", control);
 
         for &ab in control.add {
             let fb = ab.wrapping_add(older[older_pos]);
@@ -460,7 +516,11 @@ pub fn assert_cycle(older: &[u8], newer: &[u8]) {
 
     translator.close().unwrap();
 
-    assert_eq!(newer_pos, newer.len());
+    assert_eq!(
+        newer_pos,
+        newer.len(),
+        "fresh should have same length as newer"
+    );
 }
 
 #[cfg(test)]
@@ -495,6 +555,23 @@ mod tests {
             }
         }
         newer
+    }
+
+    #[test]
+    fn short_patch() {
+        let older = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 2, 0,
+        ];
+        let instructions = [
+            12, 16, 5, 40, 132, 1, 47, 43, 20, 86, 150, 0, 150, 0, 150, 0, 115, 31, 0, 0, 0, 0, 0,
+            0, 0, 1, 38, 188, 128, 0, 150, 0,
+        ];
+        let newer = apply_instructions(&older[..], &instructions[..]);
+
+        println!("older = {:?}", older);
+        println!("newer = {:?}", newer);
+        super::assert_cycle(&older[..], &newer[..]);
     }
 
     proptest! {
