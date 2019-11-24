@@ -11,6 +11,9 @@ use std::{
 #[cfg(feature = "enc")]
 pub mod enc;
 
+#[cfg(any(test, fuzzing))]
+pub mod instructions;
+
 #[derive(Debug)]
 pub struct Match {
     pub add_old_start: usize,
@@ -471,37 +474,8 @@ pub fn assert_cycle(older: &[u8], newer: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use super::instructions::apply_instructions;
     use proptest::prelude::*;
-
-    fn apply_instructions(older: &[u8], instructions: &[u8]) -> Vec<u8> {
-        use std::cmp::min;
-        let mut newer: Vec<_> = older.iter().map(|x| *x).collect();
-
-        for couple in instructions.chunks(2) {
-            let (i, j) = (couple[0], couple[1]);
-
-            if i < 128 {
-                let pos = (i as usize) % newer.len();
-                let len = j as usize;
-                let data: Vec<u8> = (&newer[pos..min(pos + len, newer.len())])
-                    .iter()
-                    .map(|x| *x)
-                    .collect();
-                for c in data {
-                    newer.push(c);
-                }
-            } else if i < 150 {
-                for _ in 0..(i - 128) {
-                    newer.push(j);
-                }
-            } else {
-                let a = (j as usize) % newer.len();
-                let b = (a + 1) % newer.len();
-                newer.swap(a, b);
-            }
-        }
-        newer
-    }
 
     #[test]
     fn short_patch() {
@@ -522,6 +496,7 @@ mod tests {
         #[test]
         fn cycle(older: [u8; 32], instructions: [u8; 32]) {
             let newer = apply_instructions(&older[..], &instructions[..]);
+            println!("{} => {}", older.len(), newer.len());
             super::assert_cycle(&older[..], &newer[..]);
         }
     }
