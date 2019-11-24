@@ -1,27 +1,76 @@
+use comde::{Compressor, Decompressor};
 use failure::{err_msg, Fallible};
 use log::*;
 use size::Size;
 use std::{
     fs::{self, File},
-    io::{self},
+    io::{self, Read, Seek, Write},
     path::Path,
+    str::FromStr,
     time::Instant,
 };
 
+/// Command-line arguments to bic
 struct Args {
     free: Vec<String>,
-    quality: i32,
     partitions: usize,
+    method: Method,
     chunk_size: Option<usize>,
 }
 
-impl Args {
-    fn writer_params(&self) -> bidiff::enc::WriterParams {
-        let mut params: bidiff::enc::WriterParams = Default::default();
-        params.brotli_params.quality = self.quality;
-        params
+/// Compression method used
+#[derive(Debug, Clone, Copy)]
+pub enum Method {
+    Stored,
+    Deflate,
+    Brotli,
+    Snappy,
+    Zstd,
+}
+
+impl Default for Method {
+    fn default() -> Self {
+        Self::Stored
+    }
+}
+
+impl Method {
+    fn compress<W: Write + Seek, R: Read>(
+        &self,
+        writer: &mut W,
+        reader: &mut R,
+    ) -> io::Result<comde::ByteCount> {
+        match self {
+            Self::Stored => comde::stored::StoredCompressor::new().compress(writer, reader),
+            Self::Brotli => comde::brotli::BrotliCompressor::new().compress(writer, reader),
+            _ => unreachable!(),
+        }
     }
 
+    fn decompress<W: Write, R: Read>(&self, reader: R, writer: W) -> io::Result<u64> {
+        match self {
+            Self::Stored => comde::stored::StoredDecompressor::new().copy(reader, writer),
+            Self::Brotli => comde::brotli::BrotliDecompressor::new().copy(reader, writer),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl FromStr for Method {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stored" => Ok(Method::Stored),
+            "deflate" => Ok(Method::Deflate),
+            "brotli" => Ok(Method::Brotli),
+            "snappy" => Ok(Method::Snappy),
+            "zstd" => Ok(Method::Zstd),
+            _ => Err(format!("Unknown compression method {}", s)),
+        }
+    }
+}
+
+impl Args {
     fn diff_params(&self) -> bidiff::DiffParams {
         bidiff::DiffParams {
             sort_partitions: self.partitions,
@@ -38,9 +87,9 @@ fn main() -> Fallible<()> {
 
     let mut args = pico_args::Arguments::from_env();
     let args = Args {
-        quality: args.opt_value_from_str(["--quality", "-q"])?.unwrap_or(9),
         partitions: args.opt_value_from_str("--partitions")?.unwrap_or(1),
         chunk_size: args.opt_value_from_str("--chunk-size")?,
+        method: args.opt_value_from_str("--method")?.unwrap_or_default(),
         free: args.free()?,
     };
 
@@ -103,13 +152,7 @@ where
 
     let mut patch = Vec::new();
     let before_diff = Instant::now();
-    bidiff::simple_diff_with_params(
-        &older[..],
-        &newer[..],
-        &mut patch,
-        &args.diff_params(),
-        &args.writer_params(),
-    )?;
+    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.diff_params())?;
     println!("diffed in {:?}", before_diff.elapsed());
 
     let ratio = (patch.len() as f64) / (newer.len() as f64);
@@ -140,20 +183,26 @@ where
     Ok(())
 }
 
-fn do_patch<P, O, U>(_args: &Args, patch: P, older: O, output: U) -> Fallible<()>
+fn do_patch<P, O, U>(args: &Args, patch: P, older: O, output: U) -> Fallible<()>
 where
     P: AsRef<Path>,
     O: AsRef<Path>,
     U: AsRef<Path>,
 {
+    println!("Using method {:?}", args.method);
     let start = Instant::now();
 
-    let older = File::open(older)?;
-    let patch = File::open(patch)?;
-    let mut reader = bipatch::Reader::new(patch, older)?;
+    let compatch_r = File::open(patch)?;
+    let (patch_r, patch_w) = pipe::pipe();
+    let method = args.method;
+    std::thread::spawn(move || {
+        method.decompress(compatch_r, patch_w).unwrap();
+    });
 
-    let mut output = File::create(output)?;
-    io::copy(&mut reader, &mut output)?;
+    let older_r = File::open(older)?;
+    let mut fresh_r = bipatch::Reader::new(patch_r, older_r)?;
+    let mut output_w = File::create(output)?;
+    io::copy(&mut fresh_r, &mut output_w)?;
 
     info!("Completed in {:?}", start.elapsed());
 
@@ -166,19 +215,27 @@ where
     N: AsRef<Path>,
     P: AsRef<Path>,
 {
+    println!("Using method {:?}", args.method);
     let start = Instant::now();
 
-    let older = fs::read(older)?;
-    let newer = fs::read(newer)?;
-    let mut patch = File::create(patch)?;
+    let older_contents = fs::read(older)?;
+    let newer_contents = fs::read(newer)?;
 
-    bidiff::simple_diff_with_params(
-        &older[..],
-        &newer[..],
-        &mut patch,
-        &args.diff_params(),
-        &args.writer_params(),
-    )?;
+    let (mut patch_r, mut patch_w) = pipe::pipe();
+    let diff_params = args.diff_params();
+    std::thread::spawn(move || {
+        bidiff::simple_diff_with_params(
+            &older_contents[..],
+            &newer_contents[..],
+            &mut patch_w,
+            &diff_params,
+        )
+        .unwrap();
+    });
+
+    let mut compatch_w = File::create(patch)?;
+    args.method.compress(&mut compatch_w, &mut patch_r)?;
+    compatch_w.flush()?;
 
     info!("Completed in {:?}", start.elapsed());
 

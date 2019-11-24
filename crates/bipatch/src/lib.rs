@@ -1,4 +1,3 @@
-use brotli::Decompressor;
 use byteorder::{LittleEndian, ReadBytesExt};
 use integer_encoding::VarIntReader;
 use std::{
@@ -9,7 +8,6 @@ use thiserror::Error;
 
 pub const MAGIC: u32 = 0xB1DF;
 pub const VERSION: u32 = 0x1000;
-const BROTLI_BUFFER_SIZE: usize = 4096;
 
 #[derive(Error, Debug)]
 pub enum DecodeError {
@@ -26,7 +24,7 @@ where
     R: Read,
     RS: Read + Seek,
 {
-    patch: Decompressor<R>,
+    patch: R,
     old: RS,
     state: ReaderState,
     buf: Vec<u8>,
@@ -56,7 +54,6 @@ where
             return Err(DecodeError::WrongMagic(version));
         }
 
-        let patch = Decompressor::new(patch, BROTLI_BUFFER_SIZE);
         Ok(Self {
             patch,
             old,

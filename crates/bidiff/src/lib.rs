@@ -411,7 +411,7 @@ impl fmt::Display for Size {
 
 #[cfg(feature = "enc")]
 pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
-    simple_diff_with_params(older, newer, out, &Default::default(), &Default::default())
+    simple_diff_with_params(older, newer, out, &Default::default())
 }
 
 #[cfg(feature = "enc")]
@@ -420,9 +420,8 @@ pub fn simple_diff_with_params(
     newer: &[u8],
     out: &mut dyn Write,
     diff_params: &DiffParams,
-    writer_params: &enc::WriterParams,
 ) -> Result<(), io::Error> {
-    let mut w = enc::Writer::with_params(out, writer_params)?;
+    let mut w = enc::Writer::new(out)?;
 
     let mut translator = Translator::new(older, newer, |control| w.write(control));
     diff(older, newer, diff_params, |m| translator.translate(m))?;
