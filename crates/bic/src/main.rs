@@ -216,9 +216,9 @@ where
 
     let cm = format!("{:?}", args.method);
     let cp = format!("patch {}", Size::Bytes(compatch.len()));
-    let cr = format!("{:.3}x of {}", ratio, Size::Bytes(newer.len()));
-    let cdd = format!("diffed in {:?}", diff_duration);
-    let cpd = format!("patched in {:?}", patch_duration);
+    let cr = format!("{:03.3}% of {}", ratio * 100.0, Size::Bytes(newer.len()));
+    let cdd = format!("dtime {:?}", diff_duration);
+    let cpd = format!("ptime {:?}", patch_duration);
     println!("{:12} {:20} {:27} {:20} {:20}", cm, cp, cr, cdd, cpd);
 
     Ok(())
