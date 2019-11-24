@@ -1,4 +1,5 @@
 use comde::{Compressor, Decompressor};
+use crossbeam_utils::thread;
 use failure::{err_msg, Fallible};
 use log::*;
 use size::Size;
@@ -42,16 +43,20 @@ impl Method {
     ) -> io::Result<comde::ByteCount> {
         match self {
             Self::Stored => comde::stored::StoredCompressor::new().compress(writer, reader),
+            Self::Deflate => comde::deflate::DeflateCompressor::new().compress(writer, reader),
             Self::Brotli => comde::brotli::BrotliCompressor::new().compress(writer, reader),
-            _ => unreachable!(),
+            Self::Snappy => comde::snappy::SnappyCompressor::new().compress(writer, reader),
+            Self::Zstd => comde::zstd::ZstdCompressor::new().compress(writer, reader),
         }
     }
 
     fn decompress<W: Write, R: Read>(&self, reader: R, writer: W) -> io::Result<u64> {
         match self {
             Self::Stored => comde::stored::StoredDecompressor::new().copy(reader, writer),
+            Self::Deflate => comde::deflate::DeflateDecompressor::new().copy(reader, writer),
             Self::Brotli => comde::brotli::BrotliDecompressor::new().copy(reader, writer),
-            _ => unreachable!(),
+            Self::Snappy => comde::snappy::SnappyDecompressor::new().copy(reader, writer),
+            Self::Zstd => comde::zstd::ZstdDecompressor::new().copy(reader, writer),
         }
     }
 }
@@ -140,45 +145,81 @@ where
     O: AsRef<Path>,
     N: AsRef<Path>,
 {
-    println!("reading older and newer in memory...");
+    info!("Reading older and newer in memory...");
     let (older, newer) = (older.as_ref(), newer.as_ref());
     let (older, newer) = (fs::read(older)?, fs::read(newer)?);
 
-    println!(
-        "before {}, after {}",
+    info!(
+        "Before {}, After {}",
         Size::Bytes(older.len()),
         Size::Bytes(newer.len()),
     );
 
-    let mut patch = Vec::new();
+    let mut compatch = Vec::new();
     let before_diff = Instant::now();
-    bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch, &args.diff_params())?;
-    println!("diffed in {:?}", before_diff.elapsed());
 
-    let ratio = (patch.len() as f64) / (newer.len() as f64);
-    println!(
-        "patch size: {} ({:.2}% of newer)",
-        Size::Bytes(patch.len()),
-        ratio * 100.0
-    );
+    {
+        let mut compatch_w = io::Cursor::new(&mut compatch);
+
+        let (mut patch_r, mut patch_w) = pipe::pipe();
+        thread::scope(|s| {
+            s.spawn(|_| {
+                bidiff::simple_diff_with_params(
+                    &older[..],
+                    &newer[..],
+                    &mut patch_w,
+                    &args.diff_params(),
+                )
+                .unwrap();
+                // this is important for `.compress()` to finish.
+                // since we're using scoped threads, it's never dropped
+                // otherwise.
+                drop(patch_w);
+            });
+            args.method.compress(&mut compatch_w, &mut patch_r).unwrap();
+        })
+        .unwrap();
+    }
+
+    let diff_duration = before_diff.elapsed();
+
+    let ratio = (compatch.len() as f64) / (newer.len() as f64);
 
     let mut fresh = Vec::new();
+    let before_patch = Instant::now();
     {
-        let before_patch = Instant::now();
         let mut older = io::Cursor::new(&older[..]);
-        let mut r = bipatch::Reader::new(&patch[..], &mut older)?;
-        let fresh_size = io::copy(&mut r, &mut fresh)?;
-        println!("patched in {:?}", before_patch.elapsed());
 
-        assert_eq!(fresh_size as usize, newer.len());
+        let method = args.method;
+        let (patch_r, patch_w) = pipe::pipe();
+
+        thread::scope(|s| {
+            s.spawn(|_| {
+                method.decompress(&compatch[..], patch_w).unwrap();
+            });
+
+            let mut r = bipatch::Reader::new(patch_r, &mut older).unwrap();
+            let fresh_size = io::copy(&mut r, &mut fresh).unwrap();
+
+            assert_eq!(fresh_size as usize, newer.len());
+        })
+        .unwrap();
     }
+    let patch_duration = before_patch.elapsed();
 
     let newer_hash = hmac_sha256::Hash::hash(&newer[..]);
     let fresh_hash = hmac_sha256::Hash::hash(&fresh[..]);
 
     if newer_hash != fresh_hash {
-        return Err(err_msg("hash mismatch!"));
+        return Err(err_msg("Hash mismatch!"));
     }
+
+    let cm = format!("{:?}", args.method);
+    let cp = format!("patch {}", Size::Bytes(compatch.len()));
+    let cr = format!("{:.3}x of {}", ratio, Size::Bytes(newer.len()));
+    let cdd = format!("diffed in {:?}", diff_duration);
+    let cpd = format!("patched in {:?}", patch_duration);
+    println!("{:12} {:20} {:27} {:20} {:20}", cm, cp, cr, cdd, cpd);
 
     Ok(())
 }
@@ -195,6 +236,7 @@ where
     let compatch_r = File::open(patch)?;
     let (patch_r, patch_w) = pipe::pipe();
     let method = args.method;
+
     std::thread::spawn(move || {
         method.decompress(compatch_r, patch_w).unwrap();
     });

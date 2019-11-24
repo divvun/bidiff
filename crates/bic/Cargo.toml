@@ -17,6 +17,7 @@ hmac-sha256 = "0.1.2"
 size = "0.1.2"
 failure = { version = "0.1.6", features = ["backtrace"] }
 pipe = "0.2.0"
+crossbeam-utils = "0.7.0"
 
 [dependencies.comde]
 version = "0.1.0"
