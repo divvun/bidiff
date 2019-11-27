@@ -4,6 +4,10 @@
 `bidiff` is a set of rust crates that generate and apply patches for arbitrary
 binary files.
 
+**NOTE: bidiff has not been thoroughly tested and should be considered ALPHA-GRADE SOFTWARE.**
+
+**We do not guarantee compatibility of patches between versions until v1.0.**
+
 It is particularly well-suited to deploying software updates, and:
 
   * Is written in 100% safe Rust
