@@ -1,6 +1,8 @@
 [package]
 name = "bic"
 version = "0.1.0"
+description = "A bsdiff-derived binary patching tool - example CLI tool"
+license = "Apache-2.0 OR MIT"
 authors = ["Amos Wenger <amoswenger@gmail.com>"]
 edition = "2018"
 

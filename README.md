@@ -14,6 +14,15 @@ It is particularly well-suited to deploying software updates, and:
 
 [comde]: https://crates.io/crates/comde
 
+## License
+
+This project (`bidiff`, `bipatch` and `bic`) is licensed under either of
+
+ * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
 ## Repository organization
 
 This repository contains three crates:
@@ -39,6 +48,8 @@ Diffing is a memory- and CPU-intensive task. The requirements are discussed
 below. Patching, however, can be done in streaming fashion and requires very
 little memory (only small buffers to perform addition between the "older" file
 and parts of the "patch" file).
+
+---
 
 ## Prior art: `bsdiff`
 
