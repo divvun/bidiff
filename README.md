@@ -77,10 +77,10 @@ In particular:
 `bidiff` generates patches of similar size compared to `bsdiff`, but is generally
 faster and requires less memory, thanks to the following changes.
 
-`bidiff` does suffix sorting using [divsufsort][] by Yuta Mori, a
-highly-optimized suffix sorting algorithm that has been repeatedly mentioned
-in research, despite the emergence of newer sorting methods. In particular,
-it uses a [hand-ported Rust version][divsufsort-rust] of it.
+`bidiff` does suffix sorting using a [hand-ported Rust
+version][divsufsort-rust] of [divsufsort][] by Yuta Mori, a highly-optimized
+suffix sorting algorithm that has been repeatedly mentioned in research,
+despite the emergence of newer sorting methods.
 
 [divsufsort]: https://github.com/y-256/libdivsufsort
 
