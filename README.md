@@ -4,6 +4,10 @@
 `bidiff` is a set of rust crates that generate and apply patches for arbitrary
 binary files. 
 
+**NOTE: bidiff has not been thoroughly tested and should be considered ALPHA-GRADE SOFTWARE.**
+
+**We do not guarantee compatibility of patches between versions until v1.0.**
+
 It is particularly well-suited to deploying software updates, and:
 
   * Is written in 100% safe Rust
@@ -13,6 +17,15 @@ It is particularly well-suited to deploying software updates, and:
   * Supports multiple compression formats (brotli, zstd, etc.) via [comde][] 
 
 [comde]: https://crates.io/crates/comde
+
+## License
+
+This project (`bidiff`, `bipatch` and `bic`) is licensed under either of
+
+ * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
 
 ## Benchmarks
 
@@ -56,6 +69,8 @@ Diffing is a memory- and CPU-intensive task. The requirements are discussed
 below. Patching, however, can be done in streaming fashion and requires very
 little memory (only small buffers to perform addition between the "older" file
 and parts of the "patch" file).
+
+---
 
 ## Prior art: `bsdiff`
 
