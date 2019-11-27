@@ -2,7 +2,7 @@
 # bidiff
 
 `bidiff` is a set of rust crates that generate and apply patches for arbitrary
-binary files.
+binary files. 
 
 It is particularly well-suited to deploying software updates, and:
 
@@ -13,6 +13,23 @@ It is particularly well-suited to deploying software updates, and:
   * Supports multiple compression formats (brotli, zstd, etc.) via [comde][] 
 
 [comde]: https://crates.io/crates/comde
+
+## Benchmarks
+
+In this section, we compare using bidiff to generate patches against two versions
+of well-known software, versus just compressing the newer version with `zstd` (hereafter
+referred to as "naive").
+
+All measurements are done on an	Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz, with 12 partitions and 1 MiB chunks.
+
+`zstd` compression at level 21 is used in both "naive" and "bidiff" runs:
+
+| older                         | newer         | newer size | naive size | naive time  | bidiff size    | bidiff time     |
+|-------------------------------|---------------|------------|------------|-------------|----------------|-----------------|
+| Wine 4.18 sources             | 4.19 sources  | 201 MiB    | 21.96 MiB  | 81.300s     | **182.26 KiB** | **5.220s**      |
+| Linux 5.3.13 sources          | 5.4 sources   | 894.68 MiB | 106.73 MiB | 448.145s    | **6.14 MiB**   | **57.799s**     |
+| Chromium 78 binary (build 97) | (build 108)   | 257.04 MiB | 79.73 MiB  | **116.975** | **12.81 MiB**  | 158.867s        |
+| Firefox 71 binary (build 11)  | (build 12)    | 192.49 MiB | 54.64 MiB  | **78.039s** | **6.56 MiB**   | 81.847s         |
 
 ## Repository organization
 
