@@ -121,7 +121,7 @@ where
     fn drop(&mut self) {
         // dropping a Translator ignores errors on purpose,
         // just like File does
-        self.do_close().unwrap_or_else(|_| {});
+        self.do_close().unwrap_or(());
     }
 }
 
