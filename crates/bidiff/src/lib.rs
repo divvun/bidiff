@@ -92,9 +92,10 @@ where
         // within the closure while `self.buf` is being mutated.
         let nbuf = &self.nbuf;
         let obuf = &self.obuf;
-        self.buf.extend((0..m.add_length).map(|i| {
-            nbuf[m.add_new_start + i].wrapping_sub(obuf[m.add_old_start + i])
-        }));
+        self.buf.extend(
+            (0..m.add_length)
+                .map(|i| nbuf[m.add_new_start + i].wrapping_sub(obuf[m.add_old_start + i])),
+        );
 
         self.prev_match = Some(m);
         Ok(())
