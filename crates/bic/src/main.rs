@@ -37,7 +37,7 @@ impl Default for Method {
 
 impl Method {
     fn compress<W: Write + Seek, R: Read>(
-        &self,
+        self,
         writer: &mut W,
         reader: &mut R,
     ) -> io::Result<comde::ByteCount> {
@@ -50,7 +50,7 @@ impl Method {
         }
     }
 
-    fn decompress<W: Write, R: Read>(&self, reader: R, writer: W) -> io::Result<u64> {
+    fn decompress<W: Write, R: Read>(self, reader: R, writer: W) -> io::Result<u64> {
         match self {
             Self::Stored => comde::stored::StoredDecompressor::new().copy(reader, writer),
             Self::Deflate => comde::deflate::DeflateDecompressor::new().copy(reader, writer),
