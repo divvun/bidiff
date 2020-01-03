@@ -338,8 +338,8 @@ where
             chunk_size, num_chunks
         );
 
-        let mut txs = Vec::new();
-        let mut rxs = Vec::new();
+        let mut txs = Vec::with_capacity(num_chunks);
+        let mut rxs = Vec::with_capacity(num_chunks);
         for _ in 0..num_chunks {
             let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
             txs.push(tx);
