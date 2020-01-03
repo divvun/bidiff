@@ -84,11 +84,17 @@ where
         self.send_control(Some(&m))?;
 
         self.buf.clear();
-        self.buf.reserve(m.add_length);
-        for i in 0..m.add_length {
-            self.buf
-                .push(self.nbuf[m.add_new_start + i].wrapping_sub(self.obuf[m.add_old_start + i]));
-        }
+
+        // Use `extend` here because `iter::Map<Range<usize>, F>` implements
+        // `TrustedLen`, giving better performance than `reserve` with `push`.
+        //
+        // These outer borrows are required since `self` cannot be borrowed from
+        // within the closure while `self.buf` is being mutated.
+        let nbuf = &self.nbuf;
+        let obuf = &self.obuf;
+        self.buf.extend((0..m.add_length).map(|i| {
+            nbuf[m.add_new_start + i].wrapping_sub(obuf[m.add_old_start + i])
+        }));
 
         self.prev_match = Some(m);
         Ok(())
