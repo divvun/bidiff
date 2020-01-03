@@ -161,7 +161,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
         let obuflen = self.obuf.len();
         let nbuflen = self.nbuf.len();
 
-        'outer: while self.scan < nbuflen {
+        while self.scan < nbuflen {
             let mut oldscore = 0_usize;
             self.scan += self.length;
 
