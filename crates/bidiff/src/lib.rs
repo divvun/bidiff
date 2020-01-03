@@ -386,7 +386,7 @@ struct DurationSpeed(u64, std::time::Duration);
 impl fmt::Display for DurationSpeed {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let (size, duration) = (self.0, self.1);
-        write!(f, "{:?} ({})", duration, Speed(size.into(), duration))
+        write!(f, "{:?} ({})", duration, Speed(size, duration))
     }
 }
 
