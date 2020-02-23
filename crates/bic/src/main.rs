@@ -7,7 +7,7 @@ use log::*;
 use size::Size;
 use std::{
     fs::{self, File},
-    io::{self, Read, Seek, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::PathBuf,
     str::FromStr,
     time::Instant,
@@ -57,6 +57,8 @@ struct Patch {
     older: PathBuf,
     #[argh(positional)]
     patch: PathBuf,
+    #[argh(positional)]
+    output: PathBuf,
     /// compression method to use
     #[argh(option, default = "Method::Stored")]
     method: Method,
@@ -259,13 +261,14 @@ fn do_patch(
     Patch {
         older,
         patch,
+        output,
         method,
     }: &Patch,
 ) -> Result<()> {
     println!("Using method {:?}", method);
     let start = Instant::now();
 
-    let compatch_r = File::open(patch)?;
+    let compatch_r = BufReader::new(File::open(patch).context("open patch file")?);
     let (patch_r, patch_w) = pipe::pipe();
     let method = *method;
 
@@ -278,7 +281,7 @@ fn do_patch(
 
     let older_r = File::open(older)?;
     let mut fresh_r = bipatch::Reader::new(patch_r, older_r).context("read patch")?;
-    let mut output_w = File::create(patch).context("create patch file")?;
+    let mut output_w = BufWriter::new(File::create(output).context("create patch file")?);
     io::copy(&mut fresh_r, &mut output_w).context("write output file")?;
 
     info!("Completed in {:?}", start.elapsed());
@@ -318,7 +321,7 @@ fn do_diff(
         .unwrap();
     });
 
-    let mut compatch_w = File::create(patch).context("create patch file")?;
+    let mut compatch_w = BufWriter::new(File::create(patch).context("create patch file")?);
     method
         .compress(&mut compatch_w, &mut patch_r)
         .context("write output file")?;
