@@ -4,6 +4,7 @@ use sacabase::StringIndex;
 use sacapart::PartitionedSuffixArray;
 use std::{
     cmp::min,
+    error::Error,
     io::{self, Write},
     time::Instant,
 };
@@ -39,7 +40,7 @@ pub struct Control<'a> {
 pub struct Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: std::error::Error,
+    E: Error,
 {
     obuf: &'a [u8],
     nbuf: &'a [u8],
@@ -52,7 +53,7 @@ where
 impl<'a, F, E> Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: std::error::Error,
+    E: Error,
 {
     pub fn new(obuf: &'a [u8], nbuf: &'a [u8], on_control: F) -> Self {
         Self {
@@ -117,7 +118,7 @@ where
 impl<'a, F, E> Drop for Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: std::error::Error,
+    E: Error,
 {
     fn drop(&mut self) {
         // dropping a Translator ignores errors on purpose,
@@ -296,15 +297,39 @@ impl<'a> Iterator for BsdiffIterator<'a> {
     }
 }
 
+/// Parameters used when creating diffs
 pub struct DiffParams {
-    // Number of partitions to use for suffix sorting.
-    // Increase this number increases parallelism but produces slightly worse patches.
-    pub sort_partitions: usize,
+    sort_partitions: usize,
+    scan_chunk_size: Option<usize>,
+}
 
-    // Size of chunks to use for scanning. When None, treat the
-    // input as a single chunk. Smaller chunks increase parallelism but
-    // produce slightly worse patches.
-    pub scan_chunk_size: Option<usize>,
+impl DiffParams {
+    /// Construct new diff params and check validity
+    ///
+    /// # Parameters
+    ///
+    /// - `sort_partitions`: Number of partitions to use for suffix sorting.
+    ///   Increase this number increases parallelism but produces slightly worse
+    ///   patches. Needs to be at least 1.
+    /// - `scan_chunk_size`: Size of chunks to use for scanning. When `None`, treat
+    ///   the input as a single chunk. Smaller chunks increase parallelism but
+    ///   produce slightly worse patches. When `Some`, it needs to be at least 1.
+    pub fn new(
+        sort_partitions: usize,
+        scan_chunk_size: Option<usize>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
+        if sort_partitions < 1 {
+            return Err("number of sort partitions cannot be less than 1".into());
+        }
+        if scan_chunk_size.filter(|s| *s < 1).is_some() {
+            return Err("scan chunk size cannot be less than 1".into());
+        }
+
+        Ok(Self {
+            sort_partitions,
+            scan_chunk_size,
+        })
+    }
 }
 
 impl Default for DiffParams {

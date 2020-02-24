@@ -192,10 +192,7 @@ fn do_cycle(
                     &older[..],
                     &newer[..],
                     &mut patch_w,
-                    &DiffParams {
-                        sort_partitions: *sort_partitions,
-                        scan_chunk_size: *scan_chunk_size,
-                    },
+                    &DiffParams::new(*sort_partitions, *scan_chunk_size).unwrap(),
                 )
                 .context("simple diff with params")
                 .unwrap();
@@ -306,10 +303,7 @@ fn do_diff(
     let newer_contents = fs::read(newer).context("read new file")?;
 
     let (mut patch_r, mut patch_w) = pipe::pipe();
-    let diff_params = DiffParams {
-        sort_partitions: *sort_partitions,
-        scan_chunk_size: *scan_chunk_size,
-    };
+    let diff_params = DiffParams::new(*sort_partitions, *scan_chunk_size).unwrap();
     std::thread::spawn(move || {
         bidiff::simple_diff_with_params(
             &older_contents[..],
