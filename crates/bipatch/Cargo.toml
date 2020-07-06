@@ -1,6 +1,6 @@
 [package]
 name = "bipatch"
-version = "0.1.0"
+version = "0.1.1"
 description = "A bsdiff-derived binary patching tool - patch library"
 license = "Apache-2.0 OR MIT"
 authors = ["Amos Wenger <amoswenger@gmail.com>"]
