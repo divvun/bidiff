@@ -2,21 +2,49 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use integer_encoding::VarIntReader;
 use std::{
     cmp::min,
+    error::Error as StdError,
+    fmt,
     io::{self, ErrorKind, Read, Seek, SeekFrom},
 };
-use thiserror::Error;
 
 pub const MAGIC: u32 = 0xB1DF;
 pub const VERSION: u32 = 0x1000;
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum DecodeError {
-    #[error("I/O error")]
-    IO(#[from] io::Error),
-    #[error("wrong magic: expected `{:X}`, got `{0:X}`", MAGIC)]
+    IO(io::Error),
     WrongMagic(u32),
-    #[error("wrong magic: expected `{:X}`, got `{0:X}`", VERSION)]
     WrongVersion(u32),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            DecodeError::IO(_) => write!(f, "I/O error"),
+            DecodeError::WrongMagic(e) => {
+                write!(f, "wrong magic: expected `{:X}`, got `{:X}`", MAGIC, e)
+            }
+            DecodeError::WrongVersion(e) => {
+                write!(f, "wrong version: expected `{:X}`, got `{:X}`", VERSION, e)
+            }
+        }
+    }
+}
+
+impl StdError for DecodeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            DecodeError::IO(e) => Some(e),
+            DecodeError::WrongMagic { .. } => None,
+            DecodeError::WrongVersion { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for DecodeError {
+    fn from(source: io::Error) -> Self {
+        DecodeError::IO(source)
+    }
 }
 
 pub struct Reader<R, RS>
