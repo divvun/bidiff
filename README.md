@@ -4,11 +4,7 @@
 [![CI Status](https://github.com/divvun/bidiff/workflows/CI/badge.svg)](https://github.com/divvun/bidiff/actions?query=workflow%3ACI)
 
 `bidiff` is a set of rust crates that generate and apply patches for arbitrary
-binary files. 
-
-**NOTE: bidiff has not been thoroughly tested and should be considered ALPHA-GRADE SOFTWARE.**
-
-**We do not guarantee compatibility of patches between versions until v1.0.**
+binary files.
 
 It is particularly well-suited to deploying software updates, and:
 
