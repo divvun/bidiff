@@ -175,8 +175,8 @@ fn do_cycle(
 
     info!(
         "Before {}, After {}",
-        Size::Bytes(older.len()),
-        Size::Bytes(newer.len()),
+        Size::from_bytes(older.len()),
+        Size::from_bytes(newer.len()),
     );
 
     let mut compatch = Vec::new();
@@ -245,8 +245,8 @@ fn do_cycle(
     anyhow::ensure!(newer_hash == fresh_hash, "Hash mismatch!");
 
     let cm = format!("{:?}", method);
-    let cp = format!("patch {}", Size::Bytes(compatch.len()));
-    let cr = format!("{:03.3}% of {}", ratio * 100.0, Size::Bytes(newer.len()));
+    let cp = format!("patch {}", Size::from_bytes(compatch.len()));
+    let cr = format!("{:03.3}% of {}", ratio * 100.0, Size::from_bytes(newer.len()));
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);
     println!("{:12} {:20} {:27} {:20} {:20}", cm, cp, cr, cdd, cpd);
