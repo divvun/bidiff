@@ -348,7 +348,7 @@ where
 {
     info!("building suffix array...");
     let before_suffix = Instant::now();
-    let sa = PartitionedSuffixArray::new(&obuf[..], params.sort_partitions, divsufsort::sort);
+    let sa = PartitionedSuffixArray::new(obuf, params.sort_partitions, divsufsort::sort);
     info!(
         "sorting took {}",
         DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
