@@ -246,7 +246,11 @@ fn do_cycle(
 
     let cm = format!("{:?}", method);
     let cp = format!("patch {}", Size::from_bytes(compatch.len()));
-    let cr = format!("{:03.3}% of {}", ratio * 100.0, Size::from_bytes(newer.len()));
+    let cr = format!(
+        "{:03.3}% of {}",
+        ratio * 100.0,
+        Size::from_bytes(newer.len())
+    );
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);
     println!("{:12} {:20} {:27} {:20} {:20}", cm, cp, cr, cdd, cpd);
