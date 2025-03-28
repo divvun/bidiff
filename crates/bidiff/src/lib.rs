@@ -6,8 +6,10 @@ use std::{
     cmp::min,
     error::Error,
     io::{self, Write},
-    time::Instant,
 };
+
+#[cfg(feature = "profiling")]
+use std::time::Instant;
 
 #[cfg(feature = "enc")]
 pub mod enc;
@@ -347,14 +349,20 @@ where
     F: FnMut(Match) -> Result<(), E>,
 {
     info!("building suffix array...");
+    #[cfg(feature = "profiling")]
     let before_suffix = Instant::now();
+
     let sa = PartitionedSuffixArray::new(obuf, params.sort_partitions, divsufsort::sort);
+
+    #[cfg(feature = "profiling")]
     info!(
         "sorting took {}",
         DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
     );
 
+    #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
+
     if let Some(chunk_size) = params.scan_chunk_size {
         // +1 to make sure we don't have > num_partitions
         let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
@@ -396,6 +404,7 @@ where
         }
     }
 
+    #[cfg(feature = "profiling")]
     info!(
         "scanning took {}",
         DurationSpeed(obuf.len() as u64, before_scan.elapsed())
@@ -404,42 +413,48 @@ where
     Ok(())
 }
 
-use std::fmt;
+#[cfg(feature = "profiling")]
+mod profiling {
+    use std::fmt;
 
-struct DurationSpeed(u64, std::time::Duration);
+    pub struct DurationSpeed(pub u64, pub std::time::Duration);
 
-impl fmt::Display for DurationSpeed {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let (size, duration) = (self.0, self.1);
-        write!(f, "{:?} ({})", duration, Speed(size, duration))
+    impl fmt::Display for DurationSpeed {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let (size, duration) = (self.0, self.1);
+            write!(f, "{:?} ({})", duration, Speed(size, duration))
+        }
     }
-}
 
-struct Speed(u64, std::time::Duration);
+    pub struct Speed(u64, std::time::Duration);
 
-impl fmt::Display for Speed {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let (size, duration) = (self.0, self.1);
-        let per_sec = size as f64 / duration.as_secs_f64();
-        write!(f, "{} / s", Size(per_sec as u64))
+    impl fmt::Display for Speed {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let (size, duration) = (self.0, self.1);
+            let per_sec = size as f64 / duration.as_secs_f64();
+            write!(f, "{} / s", Size(per_sec as u64))
+        }
     }
-}
 
-struct Size(u64);
+    pub struct Size(u64);
 
-impl fmt::Display for Size {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let x = self.0;
+    impl fmt::Display for Size {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let x = self.0;
 
-        if x > 1024 * 1024 {
-            write!(f, "{:.2} MiB", x as f64 / (1024.0 * 1024.0))
-        } else if x > 1024 {
-            write!(f, "{:.1} KiB", x as f64 / (1024.0))
-        } else {
-            write!(f, "{} B", x)
+            if x > 1024 * 1024 {
+                write!(f, "{:.2} MiB", x as f64 / (1024.0 * 1024.0))
+            } else if x > 1024 {
+                write!(f, "{:.1} KiB", x as f64 / (1024.0))
+            } else {
+                write!(f, "{} B", x)
+            }
         }
     }
 }
+
+#[cfg(feature = "profiling")]
+use profiling::DurationSpeed;
 
 #[cfg(feature = "enc")]
 pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {

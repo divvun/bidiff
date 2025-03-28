@@ -8,9 +8,10 @@ edition = "2018"
 repository = "https://github.com/divvun/bidiff"
 
 [features]
-default = ["enc"]
+default = ["enc", "profiling"]
 enc = ["byteorder", "integer-encoding"]
 instructions = []
+profiling = []
 
 [dependencies]
 # for enc
