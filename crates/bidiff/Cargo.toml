@@ -11,6 +11,7 @@ repository = "https://github.com/divvun/bidiff"
 default = ["enc"]
 enc = ["byteorder", "integer-encoding"]
 instructions = []
+profiling = []
 
 [dependencies]
 # for enc
