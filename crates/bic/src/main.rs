@@ -1,15 +1,14 @@
 use anyhow::{Context, Result};
 use argh::FromArgs;
 use bidiff::DiffParams;
-use comde::{Compressor, Decompressor};
 use crossbeam_utils::thread;
 use log::*;
+use memmap2::Mmap;
 use size::Size;
 use std::{
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, Write},
+    fs::File,
+    io::{self, BufReader, BufWriter, Write},
     path::PathBuf,
-    str::FromStr,
     time::Instant,
 };
 
@@ -38,12 +37,9 @@ struct Diff {
     newer: PathBuf,
     #[argh(positional)]
     patch: PathBuf,
-    /// number of partitions
-    #[argh(option, default = "1")]
-    sort_partitions: usize,
-    /// compression method to use
-    #[argh(option, default = "Method::Stored")]
-    method: Method,
+    /// hash index block size (default 32, minimum 4)
+    #[argh(option, default = "32")]
+    block_size: usize,
     /// optionally specify a chunk size
     #[argh(option)]
     scan_chunk_size: Option<usize>,
@@ -59,9 +55,6 @@ struct Patch {
     patch: PathBuf,
     #[argh(positional)]
     output: PathBuf,
-    /// compression method to use
-    #[argh(option, default = "Method::Stored")]
-    method: Method,
 }
 
 /// Cycle
@@ -72,71 +65,12 @@ struct Cycle {
     older: PathBuf,
     #[argh(positional)]
     newer: PathBuf,
-    /// number of partitions
-    #[argh(option, default = "1")]
-    sort_partitions: usize,
-    /// compression method to use
-    #[argh(option, default = "Method::Stored")]
-    method: Method,
+    /// hash index block size (default 32, minimum 4)
+    #[argh(option, default = "32")]
+    block_size: usize,
     /// optionally specify a chunk size
     #[argh(option)]
     scan_chunk_size: Option<usize>,
-}
-
-/// Compression method used
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    Stored,
-    Deflate,
-    Brotli,
-    Snappy,
-    Zstd,
-}
-
-impl Default for Method {
-    fn default() -> Self {
-        Self::Stored
-    }
-}
-
-impl Method {
-    fn compress<W: Write + Seek, R: Read>(
-        self,
-        writer: &mut W,
-        reader: &mut R,
-    ) -> io::Result<comde::ByteCount> {
-        match self {
-            Self::Stored => comde::stored::StoredCompressor::new().compress(writer, reader),
-            Self::Deflate => comde::deflate::DeflateCompressor::new().compress(writer, reader),
-            Self::Brotli => comde::brotli::BrotliCompressor::new().compress(writer, reader),
-            Self::Snappy => comde::snappy::SnappyCompressor::new().compress(writer, reader),
-            Self::Zstd => comde::zstd::ZstdCompressor::new().compress(writer, reader),
-        }
-    }
-
-    fn decompress<W: Write, R: Read>(self, reader: R, writer: W) -> io::Result<u64> {
-        match self {
-            Self::Stored => comde::stored::StoredDecompressor::new().copy(reader, writer),
-            Self::Deflate => comde::deflate::DeflateDecompressor::new().copy(reader, writer),
-            Self::Brotli => comde::brotli::BrotliDecompressor::new().copy(reader, writer),
-            Self::Snappy => comde::snappy::SnappyDecompressor::new().copy(reader, writer),
-            Self::Zstd => comde::zstd::ZstdDecompressor::new().copy(reader, writer),
-        }
-    }
-}
-
-impl FromStr for Method {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "stored" => Ok(Method::Stored),
-            "deflate" => Ok(Method::Deflate),
-            "brotli" => Ok(Method::Brotli),
-            "snappy" => Ok(Method::Snappy),
-            "zstd" => Ok(Method::Zstd),
-            _ => Err(format!("Unknown compression method {}", s)),
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -165,13 +99,12 @@ fn do_cycle(
     Cycle {
         older,
         newer,
-        method,
-        sort_partitions,
+        block_size,
         scan_chunk_size,
     }: &Cycle,
 ) -> Result<()> {
-    info!("Reading older and newer in memory...");
-    let (older, newer) = (fs::read(older)?, fs::read(newer)?);
+    info!("Memory-mapping older and newer...");
+    let (older, newer) = (mmap_file(older)?, mmap_file(newer)?);
 
     info!(
         "Before {}, After {}",
@@ -186,23 +119,18 @@ fn do_cycle(
         let mut compatch_w = io::Cursor::new(&mut compatch);
 
         let (mut patch_r, mut patch_w) = pipe::pipe();
+        let diff_params = DiffParams::new(*block_size, *scan_chunk_size).unwrap();
         thread::scope(|s| {
             s.spawn(|_| {
-                bidiff::simple_diff_with_params(
-                    &older[..],
-                    &newer[..],
-                    &mut patch_w,
-                    &DiffParams::new(*sort_partitions, *scan_chunk_size).unwrap(),
-                )
-                .context("simple diff with params")
-                .unwrap();
+                bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch_w, &diff_params)
+                    .context("simple diff with params")
+                    .unwrap();
                 // this is important for `.compress()` to finish.
                 // since we're using scoped threads, it's never dropped
                 // otherwise.
                 drop(patch_w);
             });
-            method
-                .compress(&mut compatch_w, &mut patch_r)
+            zstd::stream::copy_encode(&mut patch_r, &mut compatch_w, 3)
                 .context("compress")
                 .unwrap();
         })
@@ -222,8 +150,7 @@ fn do_cycle(
 
         thread::scope(|s| {
             s.spawn(|_| {
-                method
-                    .decompress(&compatch[..], patch_w)
+                zstd::stream::copy_decode(&compatch[..], patch_w)
                     .context("decompress")
                     .unwrap();
             });
@@ -244,7 +171,6 @@ fn do_cycle(
 
     anyhow::ensure!(newer_hash == fresh_hash, "Hash mismatch!");
 
-    let cm = format!("{:?}", method);
     let cp = format!("patch {}", Size::from_bytes(compatch.len()));
     let cr = format!(
         "{:03.3}% of {}",
@@ -253,7 +179,7 @@ fn do_cycle(
     );
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);
-    println!("{:12} {:20} {:27} {:20} {:20}", cm, cp, cr, cdd, cpd);
+    println!("{:12} {:20} {:27} {:20} {:20}", "zstd", cp, cr, cdd, cpd);
 
     Ok(())
 }
@@ -263,19 +189,15 @@ fn do_patch(
         older,
         patch,
         output,
-        method,
     }: &Patch,
 ) -> Result<()> {
-    println!("Using method {:?}", method);
     let start = Instant::now();
 
     let compatch_r = BufReader::new(File::open(patch).context("open patch file")?);
     let (patch_r, patch_w) = pipe::pipe();
-    let method = *method;
 
     std::thread::spawn(move || {
-        method
-            .decompress(compatch_r, patch_w)
+        zstd::stream::copy_decode(compatch_r, patch_w)
             .context("decompress")
             .unwrap();
     });
@@ -290,40 +212,51 @@ fn do_patch(
     Ok(())
 }
 
+fn mmap_file(path: &PathBuf) -> Result<Mmap> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))
+}
+
 fn do_diff(
     Diff {
         older,
         newer,
         patch,
-        method,
-        sort_partitions,
+        block_size,
         scan_chunk_size,
     }: &Diff,
 ) -> Result<()> {
-    println!("Using method {:?}", method);
     let start = Instant::now();
 
-    let older_contents = fs::read(older).context("read old file")?;
-    let newer_contents = fs::read(newer).context("read new file")?;
+    let older_contents = mmap_file(older)?;
+    let newer_contents = mmap_file(newer)?;
 
     let (mut patch_r, mut patch_w) = pipe::pipe();
-    let diff_params = DiffParams::new(*sort_partitions, *scan_chunk_size).unwrap();
-    std::thread::spawn(move || {
-        bidiff::simple_diff_with_params(
-            &older_contents[..],
-            &newer_contents[..],
-            &mut patch_w,
-            &diff_params,
-        )
-        .context("simple diff with params")
-        .unwrap();
-    });
+    let diff_params = DiffParams::new(*block_size, *scan_chunk_size).unwrap();
+    thread::scope(|s| {
+        s.spawn(|_| {
+            bidiff::simple_diff_with_params(
+                &older_contents[..],
+                &newer_contents[..],
+                &mut patch_w,
+                &diff_params,
+            )
+            .context("simple diff with params")
+            .unwrap();
+            drop(patch_w);
+        });
 
-    let mut compatch_w = BufWriter::new(File::create(patch).context("create patch file")?);
-    method
-        .compress(&mut compatch_w, &mut patch_r)
-        .context("write output file")?;
-    compatch_w.flush().context("finish writing output file")?;
+        let mut compatch_w =
+            BufWriter::new(File::create(patch).context("create patch file").unwrap());
+        zstd::stream::copy_encode(&mut patch_r, &mut compatch_w, 3)
+            .context("write output file")
+            .unwrap();
+        compatch_w
+            .flush()
+            .context("finish writing output file")
+            .unwrap();
+    })
+    .unwrap();
 
     info!("Completed in {:?}", start.elapsed());
 

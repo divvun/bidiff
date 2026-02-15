@@ -20,10 +20,10 @@ integer-encoding = { version = "3.0.4", optional = true, default-features = fals
 
 # other deps
 log = "0.4.17"
-sacabase = "2.0.0"
-sacapart = "2.0.0"
-divsufsort = "2.0.0"
 rayon = "1.6.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1.0.0"

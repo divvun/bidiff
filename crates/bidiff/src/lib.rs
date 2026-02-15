@@ -1,18 +1,20 @@
 use log::*;
 use rayon::prelude::*;
-use sacabase::StringIndex;
-use sacapart::PartitionedSuffixArray;
 use std::{
     cmp::min,
     error::Error,
     io::{self, Write},
 };
 
+use hashindex::HashIndex;
+
 #[cfg(feature = "profiling")]
 use std::time::Instant;
 
 #[cfg(feature = "enc")]
 pub mod enc;
+
+pub mod hashindex;
 
 #[cfg(any(test, feature = "instructions"))]
 pub mod instructions;
@@ -88,17 +90,12 @@ where
 
         self.buf.clear();
 
-        // Use `extend` here because `iter::Map<Range<usize>, F>` implements
-        // `TrustedLen`, giving better performance than `reserve` with `push`.
-        //
-        // These outer borrows are required since `self` cannot be borrowed from
-        // within the closure while `self.buf` is being mutated.
-        let nbuf = &self.nbuf;
-        let obuf = &self.obuf;
-        self.buf.extend(
-            (0..m.add_length)
-                .map(|i| nbuf[m.add_new_start + i].wrapping_sub(obuf[m.add_old_start + i])),
-        );
+        // Slice + zip lets the compiler see matching lengths and elide bounds
+        // checks, enabling auto-vectorization of the wrapping_sub loop.
+        let n_slice = &self.nbuf[m.add_new_start..m.add_new_start + m.add_length];
+        let o_slice = &self.obuf[m.add_old_start..m.add_old_start + m.add_length];
+        self.buf
+            .extend(n_slice.iter().zip(o_slice).map(|(a, b)| a.wrapping_sub(*b)));
 
         self.prev_match = Some(m);
         Ok(())
@@ -139,11 +136,11 @@ struct BsdiffIterator<'a> {
 
     obuf: &'a [u8],
     nbuf: &'a [u8],
-    sa: &'a dyn StringIndex<'a>,
+    sa: &'a HashIndex<'a>,
 }
 
 impl<'a> BsdiffIterator<'a> {
-    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a dyn StringIndex<'a>) -> Self {
+    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a HashIndex<'a>) -> Self {
         Self {
             scan: 0,
             pos: 0,
@@ -165,7 +162,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
         let nbuflen = self.nbuf.len();
 
         while self.scan < nbuflen {
-            let mut oldscore = 0_usize;
+            let mut oldscore = 0_isize;
             self.scan += self.length;
 
             let mut scsc = self.scan;
@@ -184,8 +181,8 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                     }
                 }
 
-                let significantly_better = self.length > oldscore + 8;
-                let same_length = self.length == oldscore && self.length != 0;
+                let significantly_better = self.length as isize > oldscore + 8;
+                let same_length = self.length as isize == oldscore && self.length != 0;
 
                 if same_length || significantly_better {
                     break 'inner;
@@ -202,7 +199,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
             } // 'inner
 
             let done_scanning = self.scan == nbuflen;
-            if self.length != oldscore || done_scanning {
+            if self.length as isize != oldscore || done_scanning {
                 // length forward from lastscan
                 let mut lenf = {
                     let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
@@ -301,8 +298,9 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 
 /// Parameters used when creating diffs
 pub struct DiffParams {
-    sort_partitions: usize,
-    scan_chunk_size: Option<usize>,
+    /// Block size for hash index (default 32). Must be >= 4.
+    pub block_size: usize,
+    pub(crate) scan_chunk_size: Option<usize>,
 }
 
 impl DiffParams {
@@ -310,25 +308,24 @@ impl DiffParams {
     ///
     /// # Parameters
     ///
-    /// - `sort_partitions`: Number of partitions to use for suffix sorting.
-    ///   Increase this number increases parallelism but produces slightly worse
-    ///   patches. Needs to be at least 1.
+    /// - `block_size`: Hash index block size. Controls granularity of matching.
+    ///   Smaller blocks find more matches but use more memory. Must be >= 4.
     /// - `scan_chunk_size`: Size of chunks to use for scanning. When `None`, treat
     ///   the input as a single chunk. Smaller chunks increase parallelism but
     ///   produce slightly worse patches. When `Some`, it needs to be at least 1.
     pub fn new(
-        sort_partitions: usize,
+        block_size: usize,
         scan_chunk_size: Option<usize>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
-        if sort_partitions < 1 {
-            return Err("number of sort partitions cannot be less than 1".into());
+        if block_size < 4 {
+            return Err("block size cannot be less than 4".into());
         }
         if scan_chunk_size.filter(|s| *s < 1).is_some() {
             return Err("scan chunk size cannot be less than 1".into());
         }
 
         Ok(Self {
-            sort_partitions,
+            block_size,
             scan_chunk_size,
         })
     }
@@ -337,7 +334,7 @@ impl DiffParams {
 impl Default for DiffParams {
     fn default() -> Self {
         Self {
-            sort_partitions: 1,
+            block_size: hashindex::DEFAULT_BLOCK_SIZE,
             scan_chunk_size: None,
         }
     }
@@ -348,24 +345,13 @@ pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], params: &DiffParams, mut on_match: F
 where
     F: FnMut(Match) -> Result<(), E>,
 {
-    info!("building suffix array...");
-    #[cfg(feature = "profiling")]
-    let before_suffix = Instant::now();
-
-    let sa = PartitionedSuffixArray::new(obuf, params.sort_partitions, divsufsort::sort);
-
-    #[cfg(feature = "profiling")]
-    info!(
-        "sorting took {}",
-        DurationSpeed(obuf.len() as u64, before_suffix.elapsed())
-    );
+    let index = HashIndex::new(obuf, params.block_size);
 
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
 
     if let Some(chunk_size) = params.scan_chunk_size {
-        // +1 to make sure we don't have > num_partitions
-        let num_chunks = (nbuf.len() + chunk_size - 1) / chunk_size;
+        let num_chunks = nbuf.len().div_ceil(chunk_size);
 
         info!(
             "scanning with {}B chunks... ({} chunks total)",
@@ -381,7 +367,7 @@ where
         }
 
         nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-            let iter = BsdiffIterator::new(obuf, nbuf, &sa);
+            let iter = BsdiffIterator::new(obuf, nbuf, &index);
             tx.send(iter.collect()).expect("should send results");
         });
 
@@ -389,17 +375,13 @@ where
             let offset = i * chunk_size;
             let v = rx.recv().expect("should receive results");
             for mut m in v {
-                // if m.add_length == 0 && m.copy_end == m.copy_start() {
-                //     continue;
-                // }
-
                 m.add_new_start += offset;
                 m.copy_end += offset;
                 on_match(m)?;
             }
         }
     } else {
-        for m in BsdiffIterator::new(obuf, nbuf, &sa) {
+        for m in BsdiffIterator::new(obuf, nbuf, &index) {
             on_match(m)?
         }
     }
@@ -478,6 +460,10 @@ pub fn simple_diff_with_params(
 }
 
 pub fn assert_cycle(older: &[u8], newer: &[u8]) {
+    assert_cycle_with_params(older, newer, &Default::default());
+}
+
+pub fn assert_cycle_with_params(older: &[u8], newer: &[u8], params: &DiffParams) {
     let mut older_pos = 0_usize;
     let mut newer_pos = 0_usize;
 
@@ -504,10 +490,7 @@ pub fn assert_cycle(older: &[u8], newer: &[u8]) {
         Ok(())
     });
 
-    diff(older, newer, &Default::default(), |m| {
-        translator.translate(m)
-    })
-    .unwrap();
+    diff(older, newer, params, |m| translator.translate(m)).unwrap();
 
     translator.close().unwrap();
 
@@ -521,6 +504,7 @@ pub fn assert_cycle(older: &[u8], newer: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::instructions::apply_instructions;
+    use super::*;
     use proptest::prelude::*;
 
     #[test]
@@ -544,6 +528,16 @@ mod tests {
             let newer = apply_instructions(&older[..], &instructions[..]);
             println!("{} => {}", older.len(), newer.len());
             super::assert_cycle(&older[..], &newer[..]);
+        }
+
+        #[test]
+        fn cycle_hashindex(
+            older in proptest::collection::vec(any::<u8>(), 64..256),
+            instructions in proptest::collection::vec(any::<u8>(), 32..128),
+        ) {
+            let newer = apply_instructions(&older[..], &instructions[..]);
+            let params = DiffParams::new(4, None).unwrap();
+            super::assert_cycle_with_params(&older[..], &newer[..], &params);
         }
     }
 }

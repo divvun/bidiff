@@ -11,6 +11,7 @@ repository = "https://github.com/divvun/bidiff"
 bidiff = { path = "../bidiff", features = ["enc"] }
 bipatch = { path = "../bipatch" }
 
+memmap2 = "0.9"
 log = "0.4.17"
 env_logger = "0.10.0"
 byteorder = "1.4.3"
@@ -22,7 +23,4 @@ crossbeam-utils = "0.8.14"
 argh = "0.1.10"
 anyhow = "1.0.68"
 
-[dependencies.comde]
-version = "0.2.3"
-default-features = false
-features = ["snappy", "deflate", "zstandard", "brotli"]
+zstd = "0.13"
