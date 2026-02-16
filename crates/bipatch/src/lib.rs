@@ -1,4 +1,3 @@
-use byteorder::{LittleEndian, ReadBytesExt};
 use integer_encoding::VarIntReader;
 use std::{
     cmp::min,
@@ -8,7 +7,7 @@ use std::{
 };
 
 pub const MAGIC: u32 = 0xB1DF;
-pub const VERSION: u32 = 0x1000;
+pub const VERSION: u32 = 0x2000;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -47,6 +46,12 @@ impl From<io::Error> for DecodeError {
     }
 }
 
+fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
 pub struct Reader<R, RS>
 where
     R: Read,
@@ -72,14 +77,14 @@ where
     RS: Read + Seek,
 {
     pub fn new(mut patch: R, old: RS) -> Result<Self, DecodeError> {
-        let magic = patch.read_u32::<LittleEndian>()?;
+        let magic = read_u32_le(&mut patch)?;
         if magic != MAGIC {
             return Err(DecodeError::WrongMagic(magic));
         }
 
-        let version = patch.read_u32::<LittleEndian>()?;
+        let version = read_u32_le(&mut patch)?;
         if version != VERSION {
-            return Err(DecodeError::WrongMagic(version));
+            return Err(DecodeError::WrongVersion(version));
         }
 
         Ok(Self {

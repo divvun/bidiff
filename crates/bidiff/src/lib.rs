@@ -1,10 +1,10 @@
-#[cfg(any(feature = "enc", feature = "parallel"))]
-use log::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 #[cfg(feature = "enc")]
 use std::io::{self, Write};
 use std::{cmp::min, error::Error};
+#[cfg(any(feature = "enc", feature = "parallel"))]
+use tracing::info;
 
 use hashindex::HashIndex;
 
@@ -355,6 +355,10 @@ pub struct DiffParams {
     /// Only used when the `parallel` feature is enabled.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) scan_chunk_size: Option<usize>,
+    /// Max threads for parallel scanning. `None` = use all available cores.
+    /// Only used when the `parallel` feature is enabled and `scan_chunk_size` is set.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) num_threads: Option<usize>,
 }
 
 impl DiffParams {
@@ -371,16 +375,29 @@ impl DiffParams {
         block_size: usize,
         scan_chunk_size: Option<usize>,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
+        Self::with_threads(block_size, scan_chunk_size, None)
+    }
+
+    /// Like `new`, but also sets the maximum number of threads for parallel scanning.
+    pub fn with_threads(
+        block_size: usize,
+        scan_chunk_size: Option<usize>,
+        num_threads: Option<usize>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
         if block_size < 4 {
             return Err("block size cannot be less than 4".into());
         }
         if scan_chunk_size.filter(|s| *s < 1).is_some() {
             return Err("scan chunk size cannot be less than 1".into());
         }
+        if num_threads.filter(|n| *n < 1).is_some() {
+            return Err("num_threads cannot be less than 1".into());
+        }
 
         Ok(Self {
             block_size,
             scan_chunk_size,
+            num_threads,
         })
     }
 }
@@ -390,6 +407,7 @@ impl Default for DiffParams {
         Self {
             block_size: hashindex::DEFAULT_BLOCK_SIZE,
             scan_chunk_size: None,
+            num_threads: None,
         }
     }
 }
@@ -428,10 +446,22 @@ where
                 rxs.push(rx);
             }
 
-            nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-                let iter = BsdiffIterator::new(obuf, nbuf, &index);
-                tx.send(iter.collect()).expect("should send results");
-            });
+            let do_scan = |txs: Vec<std::sync::mpsc::Sender<Vec<Match>>>| {
+                nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
+                    let iter = BsdiffIterator::new(obuf, nbuf, &index);
+                    tx.send(iter.collect()).expect("should send results");
+                });
+            };
+
+            if let Some(n) = params.num_threads {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .expect("failed to build thread pool");
+                pool.install(|| do_scan(txs));
+            } else {
+                do_scan(txs);
+            }
 
             for (i, rx) in rxs.into_iter().enumerate() {
                 let offset = i * chunk_size;

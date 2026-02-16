@@ -1,10 +1,9 @@
 use super::Control;
-use byteorder::{LittleEndian, WriteBytesExt};
 use integer_encoding::VarIntWriter;
 use std::io::{self, Write};
 
 pub const MAGIC: u32 = 0xB1DF;
-pub const VERSION: u32 = 0x1000;
+pub const VERSION: u32 = 0x2000;
 
 pub struct Writer<W>
 where
@@ -18,8 +17,8 @@ where
     W: Write,
 {
     pub fn new(mut w: W) -> Result<Self, io::Error> {
-        w.write_u32::<LittleEndian>(MAGIC)?;
-        w.write_u32::<LittleEndian>(VERSION)?;
+        w.write_all(&MAGIC.to_le_bytes())?;
+        w.write_all(&VERSION.to_le_bytes())?;
 
         Ok(Self { w })
     }

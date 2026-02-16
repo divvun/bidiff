@@ -4,27 +4,25 @@ version = "1.1.0"
 description = "A bsdiff-derived binary patching tool - patch library"
 license = "Apache-2.0 OR MIT"
 authors = ["Amos Wenger <amoswenger@gmail.com>"]
-edition = "2018"
+edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
 [features]
 default = ["enc"]
-enc = ["byteorder", "integer-encoding"]
+enc = ["integer-encoding"]
 parallel = ["rayon"]
 instructions = []
 profiling = []
 
 [dependencies]
 # for enc
-byteorder = { version = "1.4.3", optional = true }
-integer-encoding = { version = "3.0.4", optional = true, default-features = false }
+integer-encoding = { workspace = true, optional = true }
 
 # other deps
-log = "0.4.17"
-rayon = { version = "1.6.1", optional = true }
-memmap2 = "0.9"
+tracing.workspace = true
+rayon = { version = "1.11", optional = true }
+memmap2.workspace = true
 tempfile = "3"
 
 [dev-dependencies]
-proptest = "1.0.0"
-
+proptest = "1"

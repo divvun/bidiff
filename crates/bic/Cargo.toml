@@ -4,23 +4,21 @@ version = "1.1.0"
 description = "A bsdiff-derived binary patching tool - example CLI tool"
 license = "Apache-2.0 OR MIT"
 authors = ["Amos Wenger <amoswenger@gmail.com>"]
-edition = "2018"
+edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
 [dependencies]
 bidiff = { path = "../bidiff", features = ["enc", "parallel"] }
 bipatch = { path = "../bipatch" }
 
-memmap2 = "0.9"
-log = "0.4.17"
-env_logger = "0.10.0"
-byteorder = "1.4.3"
-integer-encoding = "3.0.4"
+memmap2.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 mimalloc = "0.1"
-size = "0.4.1"
+size = "0.5"
 os_pipe = "1"
-argh = "0.1.10"
-anyhow = "1.0.68"
+anyhow = "1"
 
 zstd = "0.13"

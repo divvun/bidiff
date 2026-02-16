@@ -1,10 +1,16 @@
 
 [workspace]
+resolver = "3"
 members = [
     "crates/bidiff",
     "crates/bipatch",
     "crates/bic"
 ]
+
+[workspace.dependencies]
+integer-encoding = { version = "4", default-features = false }
+tracing = "0.1"
+memmap2 = "0.9"
 
 [profile.release]
 debug = true
