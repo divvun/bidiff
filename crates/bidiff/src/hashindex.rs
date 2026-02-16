@@ -26,26 +26,8 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 
     // Compare 8 bytes at a time using u64 XOR
     while i + 8 <= n {
-        let a_chunk = u64::from_ne_bytes([
-            a[i],
-            a[i + 1],
-            a[i + 2],
-            a[i + 3],
-            a[i + 4],
-            a[i + 5],
-            a[i + 6],
-            a[i + 7],
-        ]);
-        let b_chunk = u64::from_ne_bytes([
-            b[i],
-            b[i + 1],
-            b[i + 2],
-            b[i + 3],
-            b[i + 4],
-            b[i + 5],
-            b[i + 6],
-            b[i + 7],
-        ]);
+        let a_chunk = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+        let b_chunk = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
         let xor = a_chunk ^ b_chunk;
         if xor != 0 {
             #[cfg(target_endian = "little")]
@@ -129,12 +111,15 @@ mod mmap_table {
         #[inline(always)]
         pub fn prefetch(&self, i: usize) {
             debug_assert!(i < self.len);
+            let ptr = unsafe { (self.mmap.as_ptr() as *const u64).add(i) };
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    (self.mmap.as_ptr() as *const u64).add(i) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
+                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                // PRFM PLDL1KEEP: prefetch for read into L1 cache
+                std::arch::aarch64::_prefetch(ptr as *const i8, 0, 3);
             }
         }
     }
@@ -260,34 +245,36 @@ impl<'a> HashIndex<'a> {
         // Insert block-aligned positions. Iterate backwards so that earlier
         // offsets overwrite later ones with the same hash, biasing toward
         // matches earlier in the file.
-        let mut i = num_entries;
-        // Prefetch the first entry's table slot and cache its hash
-        let mut next_h = if i > 0 {
-            let offset = (i - 1) * block_size;
+        //
+        // Software-pipelined: prefetch PIPE_DEPTH entries ahead so that by
+        // the time we insert an entry, its table slot has been in the cache
+        // for ~PIPE_DEPTH iterations (~80-160ns), hiding DRAM latency.
+        const PIPE_DEPTH: usize = 8;
+        let prefill = min(PIPE_DEPTH, num_entries);
+        let mut pipe_hash = [0u64; PIPE_DEPTH];
+        let mut pipe_offset = [0u32; PIPE_DEPTH];
+
+        // Fill the pipeline: compute hashes and issue prefetches
+        for k in 0..prefill {
+            let idx = num_entries - 1 - k;
+            let offset = idx * block_size;
             let h = hash_block(&text[offset..offset + block_size]);
             table.prefetch(h as usize & mask);
-            h
-        } else {
-            0
-        };
-        while i > 0 {
-            i -= 1;
-            let offset = i * block_size;
-            let block = &text[offset..offset + block_size];
-            let h = next_h; // reuse hash computed by previous iteration's prefetch
-            let slot_start = h as usize & mask;
-            let needle_tag = (h >> 32) as u32;
+            pipe_hash[k] = h;
+            pipe_offset[k] = offset as u32;
+        }
 
-            // Prefetch the NEXT entry's table slot while we insert current,
-            // and cache its hash for the next iteration
-            if i > 0 {
-                let next_offset = (i - 1) * block_size;
-                next_h = hash_block(&text[next_offset..next_offset + block_size]);
-                table.prefetch(next_h as usize & mask);
-            }
+        // Main loop: insert from head of pipeline, refill at tail
+        let mut head = 0;
+        let mut next_idx = num_entries.saturating_sub(PIPE_DEPTH);
+        for _ in 0..num_entries {
+            let h = pipe_hash[head];
+            let offset = pipe_offset[head] as usize;
+            let needle_tag = (h >> 32) as u32;
+            let block = &text[offset..offset + block_size];
 
             // Linear probe to find an empty slot
-            let mut slot = slot_start;
+            let mut slot = h as usize & mask;
             loop {
                 let entry = table.get(slot);
                 if entry == EMPTY {
@@ -306,6 +293,17 @@ impl<'a> HashIndex<'a> {
                 }
                 slot = next_slot;
             }
+
+            // Refill this pipeline slot with the next entry (if any)
+            if next_idx > 0 {
+                next_idx -= 1;
+                let offset = next_idx * block_size;
+                let h = hash_block(&text[offset..offset + block_size]);
+                table.prefetch(h as usize & mask);
+                pipe_hash[head] = h;
+                pipe_offset[head] = offset as u32;
+            }
+            head = (head + 1) % PIPE_DEPTH;
         }
 
         Self {
@@ -387,8 +385,13 @@ impl<'a> HashIndex<'a> {
         // Hash the first block_size bytes of the needle and look up
         let block = &needle[..self.block_size];
         if let Some(text_offset) = self.lookup(block) {
-            // Found a match — extend it forward using common_prefix_len
-            let match_len = common_prefix_len(&self.text[text_offset..], needle);
+            // Found a match — extend it forward using common_prefix_len.
+            // Skip block_size bytes: lookup already verified they match.
+            let match_len = self.block_size
+                + common_prefix_len(
+                    &self.text[text_offset + self.block_size..],
+                    &needle[self.block_size..],
+                );
             LongestCommonSubstring {
                 text: self.text,
                 start: text_offset,
@@ -419,7 +422,12 @@ impl<'a> HashIndex<'a> {
 
         let block = &needle[..self.block_size];
         if let Some(text_offset) = self.lookup_with_hash(block, h) {
-            let match_len = common_prefix_len(&self.text[text_offset..], needle);
+            // Skip block_size bytes: lookup already verified they match.
+            let match_len = self.block_size
+                + common_prefix_len(
+                    &self.text[text_offset + self.block_size..],
+                    &needle[self.block_size..],
+                );
             LongestCommonSubstring {
                 text: self.text,
                 start: text_offset,

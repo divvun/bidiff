@@ -191,6 +191,15 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 } else {
                     None
                 };
+                // Lookahead prefetches: warm table slots for scan+2 and scan+3.
+                // We don't cache these hashes — recomputation is cheap
+                // vs the DRAM latency we avoid by having warm cache lines.
+                if self.scan + 2 < nbuflen {
+                    self.sa.prefetch_block(&self.nbuf[self.scan + 2..]);
+                }
+                if self.scan + 3 < nbuflen {
+                    self.sa.prefetch_block(&self.nbuf[self.scan + 3..]);
+                }
                 self.pos = res.start;
                 self.length = res.len;
 
@@ -224,6 +233,15 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 let same_length = self.length as isize == oldscore && self.length != 0;
 
                 if same_length || significantly_better {
+                    // Prefetch for the actual next scan position (scan + length),
+                    // not scan + 1 which is now stale. The lenf/lenb computation
+                    // below provides ample latency window for the prefetch.
+                    self.cached_hash = if self.scan + self.length < nbuflen {
+                        self.sa
+                            .prefetch_block(&self.nbuf[self.scan + self.length..])
+                    } else {
+                        None
+                    };
                     break 'inner;
                 }
 
@@ -417,7 +435,16 @@ pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], params: &DiffParams, mut on_match: F
 where
     F: FnMut(Match) -> Result<(), E>,
 {
+    #[cfg(feature = "profiling")]
+    let before_index = Instant::now();
+
     let index = HashIndex::new(obuf, params.block_size);
+
+    #[cfg(feature = "profiling")]
+    info!(
+        "index build took {}",
+        DurationSpeed(obuf.len() as u64, before_index.elapsed())
+    );
 
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
