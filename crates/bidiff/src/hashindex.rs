@@ -71,146 +71,72 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// MmapTable: disk-backed hash table storage
+// MmapTable: disk-backed hash table storage via memmap2
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 mod mmap_table {
+    use memmap2::{MmapMut, MmapOptions};
     use std::io;
 
-    /// A u64 array backed by a file-backed mmap.
-    /// Uses O_TMPFILE on /var/tmp for a real on-disk backing file, so the
-    /// kernel can page out entries under memory pressure without swap.
+    /// A u64 array backed by a file-backed mmap (via tempfile + memmap2).
+    /// The kernel can page out entries to disk under memory pressure.
+    /// Works cross-platform (Linux, macOS, Windows).
     pub struct MmapTable {
-        ptr: *mut u64,
+        mmap: MmapMut,
         len: usize,
     }
 
-    // MmapTable is effectively a &mut [u64] with sole ownership — safe to send/share.
+    // MmapTable has sole ownership of the mapping — safe to send/share.
     unsafe impl Send for MmapTable {}
     unsafe impl Sync for MmapTable {}
 
     impl MmapTable {
-        /// Create a new table of `len` u64 slots, all initialized to `fill`.
-        pub fn new(len: usize, fill: u64) -> io::Result<Self> {
+        /// Create a new table of `len` u64 slots, all initialized to EMPTY (u64::MAX).
+        pub fn new(len: usize) -> io::Result<Self> {
             let byte_len = len * std::mem::size_of::<u64>();
+            let file = tempfile::tempfile()?;
+            file.set_len(byte_len as u64)?;
+            let mut mmap = unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? };
+            // File handle dropped here — mapping persists, kernel can page to disk.
 
-            let ptr = unsafe {
-                // Create a temp file on a real filesystem for the hash table.
-                // File-backed mmap lets the kernel page out entries to disk
-                // under memory pressure without needing swap.
-                let fd = libc::open(
-                    b"/var/tmp\0".as_ptr() as *const libc::c_char,
-                    libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
-                    0o600,
-                );
-                if fd == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::ftruncate(fd, byte_len as libc::off_t) == -1 {
-                    let err = io::Error::last_os_error();
-                    libc::close(fd);
-                    return Err(err);
-                }
-
-                let p = libc::mmap(
-                    std::ptr::null_mut(),
-                    byte_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                );
-                libc::close(fd);
-                if p == libc::MAP_FAILED {
-                    return Err(io::Error::last_os_error());
-                }
-                libc::madvise(p, byte_len, libc::MADV_HUGEPAGE);
-                p as *mut u64
-            };
-
-            // Fill with sentinel value using memset.
-            // EMPTY is u64::MAX (all 0xFF bytes), so memset with 0xFF works.
-            debug_assert!(
-                fill == u64::MAX,
-                "memset optimization assumes fill is all-ones"
-            );
-            unsafe {
-                libc::memset(ptr as *mut libc::c_void, 0xFF, byte_len);
+            // Request transparent huge pages on Linux to reduce TLB pressure
+            // for the random access pattern of hash table probing.
+            #[cfg(target_os = "linux")]
+            {
+                use memmap2::Advice;
+                let _ = mmap.advise(Advice::HugePage);
             }
-            let table = Self { ptr, len };
 
-            Ok(table)
+            // Fill with EMPTY sentinel (u64::MAX = all 0xFF bytes).
+            mmap.fill(0xFF);
+            Ok(Self { mmap, len })
         }
 
         #[inline(always)]
         pub fn get(&self, i: usize) -> u64 {
             debug_assert!(i < self.len);
-            unsafe { self.ptr.add(i).read() }
+            unsafe { (self.mmap.as_ptr() as *const u64).add(i).read() }
         }
 
         #[inline(always)]
         pub fn set(&self, i: usize, v: u64) {
             debug_assert!(i < self.len);
             unsafe {
-                self.ptr.add(i).write(v);
+                (self.mmap.as_ptr() as *mut u64).add(i).write(v);
             }
         }
 
         #[inline(always)]
         pub fn prefetch(&self, i: usize) {
             debug_assert!(i < self.len);
+            #[cfg(target_arch = "x86_64")]
             unsafe {
-                #[cfg(target_arch = "x86_64")]
                 std::arch::x86_64::_mm_prefetch(
-                    self.ptr.add(i) as *const i8,
+                    (self.mmap.as_ptr() as *const u64).add(i) as *const i8,
                     std::arch::x86_64::_MM_HINT_T0,
                 );
             }
         }
-    }
-
-    impl Drop for MmapTable {
-        fn drop(&mut self) {
-            let byte_len = self.len * std::mem::size_of::<u64>();
-            unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, byte_len);
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-mod mmap_table {
-    use std::io;
-
-    /// Fallback: plain Vec<u64> on non-unix platforms.
-    pub struct MmapTable {
-        data: Vec<u64>,
-    }
-
-    impl MmapTable {
-        pub fn new(len: usize, fill: u64) -> io::Result<Self> {
-            Ok(Self {
-                data: vec![fill; len],
-            })
-        }
-
-        #[inline(always)]
-        pub fn get(&self, i: usize) -> u64 {
-            self.data[i]
-        }
-
-        #[inline(always)]
-        pub fn set(&self, i: usize, v: u64) {
-            // Safety: we need interior mutability for the uniform API.
-            // This is only called during single-threaded construction.
-            let slot = unsafe { &mut *(&self.data[i] as *const u64 as *mut u64) };
-            *slot = v;
-        }
-
-        #[inline(always)]
-        pub fn prefetch(&self, _i: usize) {}
     }
 }
 
@@ -223,9 +149,9 @@ use mmap_table::MmapTable;
 /// for the index vs 4n bytes for a suffix array), at the cost of slightly
 /// worse match quality (larger patches).
 ///
-/// On unix, the hash table is backed by anonymous mmap with transparent
-/// huge pages requested, reducing TLB pressure for the random access
-/// pattern of hash table probing.
+/// The hash table is backed by a file-backed mmap (via tempfile + memmap2),
+/// so the kernel can page out entries under memory pressure. On Linux,
+/// transparent huge pages are requested to reduce TLB pressure.
 ///
 /// The index stores every block-aligned position in the old text. When queried,
 /// it checks if the first `block_size` bytes of the needle match any indexed
@@ -308,7 +234,7 @@ impl<'a> HashIndex<'a> {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(2, EMPTY).expect("failed to allocate hash table"),
+                table: MmapTable::new(2).expect("failed to allocate hash table"),
                 mask: 1,
             };
         }
@@ -319,7 +245,7 @@ impl<'a> HashIndex<'a> {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(2, EMPTY).expect("failed to allocate hash table"),
+                table: MmapTable::new(2).expect("failed to allocate hash table"),
                 mask: 1,
             };
         }
@@ -329,30 +255,34 @@ impl<'a> HashIndex<'a> {
         // and ~2.5 (unsuccessful), reducing cache misses on lookup.
         let table_size = (num_entries * 2).next_power_of_two().max(2);
         let mask = table_size - 1;
-        let table = MmapTable::new(table_size, EMPTY).expect("failed to allocate hash table");
+        let table = MmapTable::new(table_size).expect("failed to allocate hash table");
 
         // Insert block-aligned positions. Iterate backwards so that earlier
         // offsets overwrite later ones with the same hash, biasing toward
         // matches earlier in the file.
         let mut i = num_entries;
-        // Prefetch the first entry's table slot
-        if i > 0 {
+        // Prefetch the first entry's table slot and cache its hash
+        let mut next_h = if i > 0 {
             let offset = (i - 1) * block_size;
             let h = hash_block(&text[offset..offset + block_size]);
             table.prefetch(h as usize & mask);
-        }
+            h
+        } else {
+            0
+        };
         while i > 0 {
             i -= 1;
             let offset = i * block_size;
             let block = &text[offset..offset + block_size];
-            let h = hash_block(block);
+            let h = next_h; // reuse hash computed by previous iteration's prefetch
             let slot_start = h as usize & mask;
             let needle_tag = (h >> 32) as u32;
 
-            // Prefetch the NEXT entry's table slot while we insert current
+            // Prefetch the NEXT entry's table slot while we insert current,
+            // and cache its hash for the next iteration
             if i > 0 {
                 let next_offset = (i - 1) * block_size;
-                let next_h = hash_block(&text[next_offset..next_offset + block_size]);
+                next_h = hash_block(&text[next_offset..next_offset + block_size]);
                 table.prefetch(next_h as usize & mask);
             }
 
@@ -392,6 +322,13 @@ impl<'a> HashIndex<'a> {
     #[inline(always)]
     fn lookup(&self, block: &[u8]) -> Option<usize> {
         let h = hash_block(block);
+        self.lookup_with_hash(block, h)
+    }
+
+    /// Look up a block using a pre-computed hash, avoiding redundant hashing
+    /// when the hash was already computed by prefetch_block.
+    #[inline(always)]
+    fn lookup_with_hash(&self, block: &[u8], h: u64) -> Option<usize> {
         let needle_tag = (h >> 32) as u32;
         let mut slot = h as usize & self.mask;
         let mut probes = 0;
@@ -419,12 +356,16 @@ impl<'a> HashIndex<'a> {
 
 impl<'a> HashIndex<'a> {
     /// Prefetch the hash table slot for a block, so a subsequent lookup is faster.
+    /// Returns the computed hash so it can be reused by lookup_with_hash.
     #[inline(always)]
-    pub fn prefetch_block(&self, data: &[u8]) {
+    pub fn prefetch_block(&self, data: &[u8]) -> Option<u64> {
         if data.len() >= self.block_size {
             let h = hash_block(&data[..self.block_size]);
             let slot = h as usize & self.mask;
             self.table.prefetch(slot);
+            Some(h)
+        } else {
+            None
         }
     }
 
@@ -447,6 +388,37 @@ impl<'a> HashIndex<'a> {
         let block = &needle[..self.block_size];
         if let Some(text_offset) = self.lookup(block) {
             // Found a match — extend it forward using common_prefix_len
+            let match_len = common_prefix_len(&self.text[text_offset..], needle);
+            LongestCommonSubstring {
+                text: self.text,
+                start: text_offset,
+                len: match_len,
+            }
+        } else {
+            LongestCommonSubstring {
+                text: self.text,
+                start: 0,
+                len: 0,
+            }
+        }
+    }
+
+    /// Like longest_substring_match but uses a pre-computed hash from prefetch_block.
+    pub fn longest_substring_match_with_hash(
+        &self,
+        needle: &[u8],
+        h: u64,
+    ) -> LongestCommonSubstring<'a> {
+        if needle.len() < self.block_size || self.text.len() < self.block_size {
+            return LongestCommonSubstring {
+                text: self.text,
+                start: 0,
+                len: 0,
+            };
+        }
+
+        let block = &needle[..self.block_size];
+        if let Some(text_offset) = self.lookup_with_hash(block, h) {
             let match_len = common_prefix_len(&self.text[text_offset..], needle);
             LongestCommonSubstring {
                 text: self.text,

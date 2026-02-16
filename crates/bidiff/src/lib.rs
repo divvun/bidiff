@@ -141,6 +141,8 @@ struct BsdiffIterator<'a> {
     lastscan: usize,
     lastpos: usize,
     lastoffset: isize,
+    /// Cached hash from prefetch_block, to avoid recomputing on lookup.
+    cached_hash: Option<u64>,
 
     obuf: &'a [u8],
     nbuf: &'a [u8],
@@ -156,6 +158,7 @@ impl<'a> BsdiffIterator<'a> {
             lastscan: 0,
             lastpos: 0,
             lastoffset: 0,
+            cached_hash: None,
             obuf,
             nbuf,
             sa,
@@ -175,12 +178,19 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 
             let mut scsc = self.scan;
             'inner: while self.scan < nbuflen {
-                let res = self.sa.longest_substring_match(&self.nbuf[self.scan..]);
-                // Prefetch the table slot for the next scan position.
+                let res = if let Some(h) = self.cached_hash.take() {
+                    self.sa
+                        .longest_substring_match_with_hash(&self.nbuf[self.scan..], h)
+                } else {
+                    self.sa.longest_substring_match(&self.nbuf[self.scan..])
+                };
+                // Prefetch the table slot for the next scan position and cache the hash.
                 // The oldscore + scoring work below provides the latency window.
-                if self.scan + 1 < nbuflen {
-                    self.sa.prefetch_block(&self.nbuf[self.scan + 1..]);
-                }
+                self.cached_hash = if self.scan + 1 < nbuflen {
+                    self.sa.prefetch_block(&self.nbuf[self.scan + 1..])
+                } else {
+                    None
+                };
                 self.pos = res.start;
                 self.length = res.len;
 

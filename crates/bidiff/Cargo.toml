@@ -22,9 +22,8 @@ integer-encoding = { version = "3.0.4", optional = true, default-features = fals
 # other deps
 log = "0.4.17"
 rayon = { version = "1.6.1", optional = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+memmap2 = "0.9"
+tempfile = "3"
 
 [dev-dependencies]
 proptest = "1.0.0"

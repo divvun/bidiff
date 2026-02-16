@@ -127,13 +127,15 @@ fn do_cycle(
     {
         let mut compatch_w = io::Cursor::new(&mut compatch);
 
-        let (mut patch_r, mut patch_w) = os_pipe::pipe().unwrap();
+        let (mut patch_r, patch_w) = os_pipe::pipe().unwrap();
         let diff_params = DiffParams::new(*block_size, *scan_chunk_size).unwrap();
         std::thread::scope(|s| {
             s.spawn(|| {
+                let mut patch_w = BufWriter::with_capacity(256 * 1024, patch_w);
                 bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch_w, &diff_params)
                     .context("simple diff with params")
                     .unwrap();
+                patch_w.flush().unwrap();
                 // this is important for `.compress()` to finish.
                 // since we're using scoped threads, it's never dropped
                 // otherwise.
@@ -150,7 +152,7 @@ fn do_cycle(
 
     let ratio = (compatch.len() as f64) / (newer.len() as f64);
 
-    let mut fresh = Vec::new();
+    let mut fresh = Vec::with_capacity(newer.len());
     let before_patch = Instant::now();
     {
         let mut older = io::Cursor::new(&older[..]);
@@ -240,10 +242,11 @@ fn do_diff(
     let older_contents = mmap_file(older)?;
     let newer_contents = mmap_file(newer)?;
 
-    let (mut patch_r, mut patch_w) = os_pipe::pipe().unwrap();
+    let (mut patch_r, patch_w) = os_pipe::pipe().unwrap();
     let diff_params = DiffParams::new(*block_size, *scan_chunk_size).unwrap();
     std::thread::scope(|s| {
         s.spawn(|| {
+            let mut patch_w = BufWriter::with_capacity(256 * 1024, patch_w);
             bidiff::simple_diff_with_params(
                 &older_contents[..],
                 &newer_contents[..],
@@ -252,6 +255,7 @@ fn do_diff(
             )
             .context("simple diff with params")
             .unwrap();
+            patch_w.flush().unwrap();
             drop(patch_w);
         });
 
