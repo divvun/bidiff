@@ -76,104 +76,107 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 
 #[cfg(unix)]
 mod mmap_table {
-    use std::fs;
     use std::io;
-    use std::os::unix::io::AsRawFd;
 
-    /// A u32 array backed by a temp file on `/var/tmp` (disk-backed, not tmpfs).
-    /// Pages are evictable under memory pressure, keeping RssAnon low.
+    /// A u64 array backed by a file-backed mmap.
+    /// Uses O_TMPFILE on /var/tmp for a real on-disk backing file, so the
+    /// kernel can page out entries under memory pressure without swap.
     pub struct MmapTable {
-        ptr: *mut u32,
+        ptr: *mut u64,
         len: usize,
-        _file: fs::File,
     }
 
-    // MmapTable is effectively a &mut [u32] with sole ownership — safe to send/share.
+    // MmapTable is effectively a &mut [u64] with sole ownership — safe to send/share.
     unsafe impl Send for MmapTable {}
     unsafe impl Sync for MmapTable {}
 
     impl MmapTable {
-        /// Create a new table of `len` u32 slots, all initialized to `fill`.
-        pub fn new(len: usize, fill: u32) -> io::Result<Self> {
-            let byte_len = len * std::mem::size_of::<u32>();
+        /// Create a new table of `len` u64 slots, all initialized to `fill`.
+        pub fn new(len: usize, fill: u64) -> io::Result<Self> {
+            let byte_len = len * std::mem::size_of::<u64>();
 
-            // Create temp file on /var/tmp (usually a real filesystem, not tmpfs)
-            let file = tempfile()?;
-
-            // Size the file
-            file.set_len(byte_len as u64)?;
-
-            // mmap it MAP_SHARED so pages can be evicted to disk
             let ptr = unsafe {
+                // Create a temp file on a real filesystem for the hash table.
+                // File-backed mmap lets the kernel page out entries to disk
+                // under memory pressure without needing swap.
+                let fd = libc::open(
+                    b"/var/tmp\0".as_ptr() as *const libc::c_char,
+                    libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                    0o600,
+                );
+                if fd == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ftruncate(fd, byte_len as libc::off_t) == -1 {
+                    let err = io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(err);
+                }
+
                 let p = libc::mmap(
                     std::ptr::null_mut(),
                     byte_len,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_SHARED,
-                    file.as_raw_fd(),
+                    fd,
                     0,
                 );
+                libc::close(fd);
                 if p == libc::MAP_FAILED {
                     return Err(io::Error::last_os_error());
                 }
-                p as *mut u32
+                libc::madvise(p, byte_len, libc::MADV_HUGEPAGE);
+                p as *mut u64
             };
 
-            // Fill with sentinel value
-            let table = Self {
-                ptr,
-                len,
-                _file: file,
-            };
-            for i in 0..len {
-                table.set(i, fill);
+            // Fill with sentinel value using memset.
+            // EMPTY is u64::MAX (all 0xFF bytes), so memset with 0xFF works.
+            debug_assert!(
+                fill == u64::MAX,
+                "memset optimization assumes fill is all-ones"
+            );
+            unsafe {
+                libc::memset(ptr as *mut libc::c_void, 0xFF, byte_len);
             }
+            let table = Self { ptr, len };
 
             Ok(table)
         }
 
         #[inline(always)]
-        pub fn get(&self, i: usize) -> u32 {
+        pub fn get(&self, i: usize) -> u64 {
             debug_assert!(i < self.len);
             unsafe { self.ptr.add(i).read() }
         }
 
         #[inline(always)]
-        pub fn set(&self, i: usize, v: u32) {
+        pub fn set(&self, i: usize, v: u64) {
             debug_assert!(i < self.len);
             unsafe {
                 self.ptr.add(i).write(v);
+            }
+        }
+
+        #[inline(always)]
+        pub fn prefetch(&self, i: usize) {
+            debug_assert!(i < self.len);
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_prefetch(
+                    self.ptr.add(i) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
             }
         }
     }
 
     impl Drop for MmapTable {
         fn drop(&mut self) {
-            let byte_len = self.len * std::mem::size_of::<u32>();
+            let byte_len = self.len * std::mem::size_of::<u64>();
             unsafe {
                 libc::munmap(self.ptr as *mut libc::c_void, byte_len);
             }
         }
-    }
-
-    /// Create an anonymous temp file on /var/tmp. The file is unlinked immediately
-    /// so it is cleaned up automatically when the fd is closed.
-    fn tempfile() -> io::Result<fs::File> {
-        use std::ffi::CString;
-        use std::os::unix::io::FromRawFd;
-
-        let template = CString::new("/var/tmp/bidiff-XXXXXX")
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut buf = template.into_bytes_with_nul();
-        let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Unlink immediately — the file stays alive via the fd
-        unsafe {
-            libc::unlink(buf.as_ptr() as *const libc::c_char);
-        }
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 }
 
@@ -181,31 +184,33 @@ mod mmap_table {
 mod mmap_table {
     use std::io;
 
-    /// Fallback: plain Vec<u32> on non-unix platforms.
+    /// Fallback: plain Vec<u64> on non-unix platforms.
     pub struct MmapTable {
-        data: Vec<u32>,
+        data: Vec<u64>,
     }
 
     impl MmapTable {
-        pub fn new(len: usize, fill: u32) -> io::Result<Self> {
+        pub fn new(len: usize, fill: u64) -> io::Result<Self> {
             Ok(Self {
                 data: vec![fill; len],
             })
         }
 
         #[inline(always)]
-        pub fn get(&self, i: usize) -> u32 {
+        pub fn get(&self, i: usize) -> u64 {
             self.data[i]
         }
 
         #[inline(always)]
-        pub fn set(&self, i: usize, v: u32) {
+        pub fn set(&self, i: usize, v: u64) {
             // Safety: we need interior mutability for the uniform API.
             // This is only called during single-threaded construction.
-            #[allow(mutable_transmutes)]
-            let slot = unsafe { &mut *(&self.data[i] as *const u32 as *mut u32) };
+            let slot = unsafe { &mut *(&self.data[i] as *const u64 as *mut u64) };
             *slot = v;
         }
+
+        #[inline(always)]
+        pub fn prefetch(&self, _i: usize) {}
     }
 }
 
@@ -218,9 +223,9 @@ use mmap_table::MmapTable;
 /// for the index vs 4n bytes for a suffix array), at the cost of slightly
 /// worse match quality (larger patches).
 ///
-/// On unix, the hash table is backed by a disk-based temp file via mmap,
-/// so its pages are evictable under memory pressure and don't count toward
-/// anonymous RSS.
+/// On unix, the hash table is backed by anonymous mmap with transparent
+/// huge pages requested, reducing TLB pressure for the random access
+/// pattern of hash table probing.
 ///
 /// The index stores every block-aligned position in the old text. When queried,
 /// it checks if the first `block_size` bytes of the needle match any indexed
@@ -230,12 +235,31 @@ pub struct HashIndex<'a> {
     text: &'a [u8],
     block_size: usize,
     /// Hash table using open addressing with linear probing.
-    /// Each slot stores a u32 offset (EMPTY = empty).
+    /// Each slot stores a packed u64: upper 32 bits = hash tag, lower 32 bits = offset.
+    /// EMPTY (u64::MAX) = empty slot.
     table: MmapTable,
     mask: usize,
 }
 
-const EMPTY: u32 = u32::MAX;
+const EMPTY: u64 = u64::MAX;
+
+/// Pack a u32 offset and the upper 32 bits of the hash into a single u64.
+#[inline(always)]
+fn pack_entry(offset: u32, hash: u64) -> u64 {
+    (hash & 0xFFFF_FFFF_0000_0000) | offset as u64
+}
+
+/// Extract the u32 offset from a packed entry.
+#[inline(always)]
+fn entry_offset(entry: u64) -> u32 {
+    entry as u32
+}
+
+/// Extract the 32-bit tag from a packed entry.
+#[inline(always)]
+fn entry_tag(entry: u64) -> u32 {
+    (entry >> 32) as u32
+}
 
 #[inline(always)]
 fn wymix(a: u64, b: u64) -> u64 {
@@ -300,10 +324,10 @@ impl<'a> HashIndex<'a> {
             };
         }
 
-        // Size table to ~1.5x the number of entries (~67% load factor).
-        // With linear probing this gives average probe length ~2.0, well
-        // within the 32-probe limit.
-        let table_size = (num_entries * 3 / 2).next_power_of_two().max(2);
+        // Size table to ~2x the number of entries (~50% load factor).
+        // With linear probing this gives average probe length ~1.5 (successful)
+        // and ~2.5 (unsuccessful), reducing cache misses on lookup.
+        let table_size = (num_entries * 2).next_power_of_two().max(2);
         let mask = table_size - 1;
         let table = MmapTable::new(table_size, EMPTY).expect("failed to allocate hash table");
 
@@ -311,26 +335,46 @@ impl<'a> HashIndex<'a> {
         // offsets overwrite later ones with the same hash, biasing toward
         // matches earlier in the file.
         let mut i = num_entries;
+        // Prefetch the first entry's table slot
+        if i > 0 {
+            let offset = (i - 1) * block_size;
+            let h = hash_block(&text[offset..offset + block_size]);
+            table.prefetch(h as usize & mask);
+        }
         while i > 0 {
             i -= 1;
             let offset = i * block_size;
             let block = &text[offset..offset + block_size];
-            let h = hash_block(block) as usize & mask;
+            let h = hash_block(block);
+            let slot_start = h as usize & mask;
+            let needle_tag = (h >> 32) as u32;
+
+            // Prefetch the NEXT entry's table slot while we insert current
+            if i > 0 {
+                let next_offset = (i - 1) * block_size;
+                let next_h = hash_block(&text[next_offset..next_offset + block_size]);
+                table.prefetch(next_h as usize & mask);
+            }
 
             // Linear probe to find an empty slot
-            let mut slot = h;
+            let mut slot = slot_start;
             loop {
-                if table.get(slot) == EMPTY {
-                    table.set(slot, offset as u32);
+                let entry = table.get(slot);
+                if entry == EMPTY {
+                    table.set(slot, pack_entry(offset as u32, h));
                     break;
                 }
-                // If existing entry has the same block content, overwrite
-                let existing = table.get(slot) as usize;
-                if &text[existing..existing + block_size] == block {
-                    table.set(slot, offset as u32);
-                    break;
+                let next_slot = (slot + 1) & mask;
+                table.prefetch(next_slot);
+                // Tag-first check: only compare text if tags match
+                if entry_tag(entry) == needle_tag {
+                    let existing = entry_offset(entry) as usize;
+                    if &text[existing..existing + block_size] == block {
+                        table.set(slot, pack_entry(offset as u32, h));
+                        break;
+                    }
                 }
-                slot = (slot + 1) & mask;
+                slot = next_slot;
             }
         }
 
@@ -343,30 +387,52 @@ impl<'a> HashIndex<'a> {
     }
 
     /// Look up a block in the hash table, returning the offset if found.
+    /// Uses a 32-bit hash tag to reject non-matching probes without accessing
+    /// the text, avoiding expensive cache misses and memcmp on most probes.
     #[inline(always)]
     fn lookup(&self, block: &[u8]) -> Option<usize> {
-        let h = hash_block(block) as usize & self.mask;
-        let mut slot = h;
+        let h = hash_block(block);
+        let needle_tag = (h >> 32) as u32;
+        let mut slot = h as usize & self.mask;
         let mut probes = 0;
         loop {
-            let offset = self.table.get(slot);
-            if offset == EMPTY {
+            let entry = self.table.get(slot);
+            if entry == EMPTY {
                 return None;
             }
-            let o = offset as usize;
-            if &self.text[o..o + self.block_size] == block {
-                return Some(o);
+            let next_slot = (slot + 1) & self.mask;
+            self.table.prefetch(next_slot);
+            if entry_tag(entry) == needle_tag {
+                let o = entry_offset(entry) as usize;
+                if &self.text[o..o + self.block_size] == block {
+                    return Some(o);
+                }
             }
             probes += 1;
             if probes > 32 {
                 return None; // give up after too many probes
             }
-            slot = (slot + 1) & self.mask;
+            slot = next_slot;
         }
     }
 }
 
 impl<'a> HashIndex<'a> {
+    /// Prefetch the hash table slot for a block, so a subsequent lookup is faster.
+    #[inline(always)]
+    pub fn prefetch_block(&self, data: &[u8]) {
+        if data.len() >= self.block_size {
+            let h = hash_block(&data[..self.block_size]);
+            let slot = h as usize & self.mask;
+            self.table.prefetch(slot);
+        }
+    }
+
+    #[inline(always)]
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     pub fn longest_substring_match(&self, needle: &[u8]) -> LongestCommonSubstring<'a> {
         // If needle is shorter than block_size, we can't hash it
         if needle.len() < self.block_size || self.text.len() < self.block_size {

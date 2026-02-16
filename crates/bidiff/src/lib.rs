@@ -1,15 +1,23 @@
+#[cfg(any(feature = "enc", feature = "parallel"))]
 use log::*;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use std::{
-    cmp::min,
-    error::Error,
-    io::{self, Write},
-};
+#[cfg(feature = "enc")]
+use std::io::{self, Write};
+use std::{cmp::min, error::Error};
 
 use hashindex::HashIndex;
 
 #[cfg(feature = "profiling")]
 use std::time::Instant;
+
+/// Count matching bytes between two slices (up to the shorter length).
+/// Written as an iterator pattern that LLVM reliably auto-vectorizes
+/// into pcmpeqb + horizontal sum.
+#[inline(always)]
+fn count_matching_bytes(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
+}
 
 #[cfg(feature = "enc")]
 pub mod enc;
@@ -168,16 +176,37 @@ impl<'a> Iterator for BsdiffIterator<'a> {
             let mut scsc = self.scan;
             'inner: while self.scan < nbuflen {
                 let res = self.sa.longest_substring_match(&self.nbuf[self.scan..]);
+                // Prefetch the table slot for the next scan position.
+                // The oldscore + scoring work below provides the latency window.
+                if self.scan + 1 < nbuflen {
+                    self.sa.prefetch_block(&self.nbuf[self.scan + 1..]);
+                }
                 self.pos = res.start;
                 self.length = res.len;
 
                 {
-                    while scsc < self.scan + self.length {
-                        let oi = (scsc as isize + self.lastoffset) as usize;
-                        if oi < obuflen && self.obuf[oi] == self.nbuf[scsc] {
-                            oldscore += 1;
+                    let end = self.scan + self.length;
+                    if scsc < end {
+                        // Pre-compute the obuf range corresponding to nbuf[scsc..end]
+                        let o_start = scsc as isize + self.lastoffset;
+                        let o_end = end as isize + self.lastoffset;
+                        if o_start >= 0 && o_end as usize <= obuflen {
+                            // Fast path: entire range is in bounds — auto-vectorizable
+                            let o_start = o_start as usize;
+                            oldscore += count_matching_bytes(
+                                &self.obuf[o_start..o_start + (end - scsc)],
+                                &self.nbuf[scsc..end],
+                            ) as isize;
+                        } else {
+                            // Slow path: partial bounds (rare, near buffer edges)
+                            for i in scsc..end {
+                                let oi = (i as isize + self.lastoffset) as usize;
+                                if oi < obuflen && self.obuf[oi] == self.nbuf[i] {
+                                    oldscore += 1;
+                                }
+                            }
                         }
-                        scsc += 1;
+                        scsc = end;
                     }
                 }
 
@@ -194,7 +223,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                         oldscore -= 1;
                     }
                 }
-
                 self.scan += 1;
             } // 'inner
 
@@ -204,8 +232,12 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 let mut lenf = {
                     let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
 
-                    for i in 0..min(self.scan - self.lastscan, obuflen - self.lastpos) {
-                        if self.obuf[self.lastpos + i] == self.nbuf[self.lastscan + i] {
+                    let n = min(self.scan - self.lastscan, obuflen - self.lastpos);
+                    let o_slice = &self.obuf[self.lastpos..self.lastpos + n];
+                    let n_slice = &self.nbuf[self.lastscan..self.lastscan + n];
+
+                    for i in 0..n {
+                        if o_slice[i] == n_slice[i] {
                             s += 1;
                         }
 
@@ -228,8 +260,14 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 } else {
                     let (mut s, mut sb, mut lenb) = (0_isize, 0_isize, 0_isize);
 
-                    for i in 1..=min(self.scan - self.lastscan, self.pos) {
-                        if self.obuf[self.pos - i] == self.nbuf[self.scan - i] {
+                    let n = min(self.scan - self.lastscan, self.pos);
+                    // Pre-slice: iterate backwards from pos/scan
+                    let o_slice = &self.obuf[self.pos - n..self.pos];
+                    let n_slice = &self.nbuf[self.scan - n..self.scan];
+
+                    for i in 1..=n {
+                        // index from end of pre-sliced regions
+                        if o_slice[n - i] == n_slice[n - i] {
                             s += 1;
                         }
 
@@ -250,14 +288,18 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 
                     let lens = {
                         let (mut s, mut ss, mut lens) = (0, 0, 0);
+                        // Pre-slice all four regions to eliminate bounds checks
+                        let last_n =
+                            &self.nbuf[self.lastscan + lenf - overlap..self.lastscan + lenf];
+                        let last_o = &self.obuf[self.lastpos + lenf - overlap..self.lastpos + lenf];
+                        let cur_n = &self.nbuf[self.scan - lenb..self.scan - lenb + overlap];
+                        let cur_o = &self.obuf[self.pos - lenb..self.pos - lenb + overlap];
                         for i in 0..overlap {
-                            if self.nbuf[self.lastscan + lenf - overlap + i]
-                                == self.obuf[self.lastpos + lenf - overlap + i]
-                            {
+                            if last_n[i] == last_o[i] {
                                 // point goes to last scan
                                 s += 1;
                             }
-                            if self.nbuf[self.scan - lenb + i] == self.obuf[self.pos - lenb + i] {
+                            if cur_n[i] == cur_o[i] {
                                 // point goes to current scan
                                 s -= 1;
                             }
@@ -300,6 +342,8 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 pub struct DiffParams {
     /// Block size for hash index (default 32). Must be >= 4.
     pub block_size: usize,
+    /// Only used when the `parallel` feature is enabled.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) scan_chunk_size: Option<usize>,
 }
 
@@ -350,34 +394,43 @@ where
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
 
-    if let Some(chunk_size) = params.scan_chunk_size {
-        let num_chunks = nbuf.len().div_ceil(chunk_size);
+    #[cfg(feature = "parallel")]
+    let use_parallel = params.scan_chunk_size.is_some();
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
 
-        info!(
-            "scanning with {}B chunks... ({} chunks total)",
-            chunk_size, num_chunks
-        );
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            let chunk_size = params.scan_chunk_size.unwrap();
+            let num_chunks = nbuf.len().div_ceil(chunk_size);
 
-        let mut txs = Vec::with_capacity(num_chunks);
-        let mut rxs = Vec::with_capacity(num_chunks);
-        for _ in 0..num_chunks {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
-            txs.push(tx);
-            rxs.push(rx);
-        }
+            info!(
+                "scanning with {}B chunks... ({} chunks total)",
+                chunk_size, num_chunks
+            );
 
-        nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-            let iter = BsdiffIterator::new(obuf, nbuf, &index);
-            tx.send(iter.collect()).expect("should send results");
-        });
+            let mut txs = Vec::with_capacity(num_chunks);
+            let mut rxs = Vec::with_capacity(num_chunks);
+            for _ in 0..num_chunks {
+                let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
+                txs.push(tx);
+                rxs.push(rx);
+            }
 
-        for (i, rx) in rxs.into_iter().enumerate() {
-            let offset = i * chunk_size;
-            let v = rx.recv().expect("should receive results");
-            for mut m in v {
-                m.add_new_start += offset;
-                m.copy_end += offset;
-                on_match(m)?;
+            nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
+                let iter = BsdiffIterator::new(obuf, nbuf, &index);
+                tx.send(iter.collect()).expect("should send results");
+            });
+
+            for (i, rx) in rxs.into_iter().enumerate() {
+                let offset = i * chunk_size;
+                let v = rx.recv().expect("should receive results");
+                for mut m in v {
+                    m.add_new_start += offset;
+                    m.copy_end += offset;
+                    on_match(m)?;
+                }
             }
         }
     } else {

@@ -10,6 +10,7 @@ repository = "https://github.com/divvun/bidiff"
 [features]
 default = ["enc"]
 enc = ["byteorder", "integer-encoding"]
+parallel = ["rayon"]
 instructions = []
 profiling = []
 
@@ -20,7 +21,7 @@ integer-encoding = { version = "3.0.4", optional = true, default-features = fals
 
 # other deps
 log = "0.4.17"
-rayon = "1.6.1"
+rayon = { version = "1.6.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
