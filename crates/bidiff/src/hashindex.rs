@@ -101,11 +101,23 @@ mod mmap_table {
         }
 
         #[inline(always)]
+        #[cfg_attr(feature = "parallel", allow(dead_code))]
         pub fn set(&self, i: usize, v: u64) {
             debug_assert!(i < self.len);
             unsafe {
                 (self.mmap.as_ptr() as *mut u64).add(i).write(v);
             }
+        }
+
+        /// Compare-and-swap for lock-free parallel insertion.
+        /// AtomicU64 has identical size/alignment to u64, so the cast is safe
+        /// on the page-aligned mmap memory.
+        #[inline(always)]
+        pub fn cas(&self, i: usize, expected: u64, new: u64) -> Result<u64, u64> {
+            debug_assert!(i < self.len);
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let atom = unsafe { &*(self.mmap.as_ptr() as *const AtomicU64).add(i) };
+            atom.compare_exchange(expected, new, Ordering::Relaxed, Ordering::Relaxed)
         }
 
         #[inline(always)]
@@ -242,68 +254,102 @@ impl<'a> HashIndex<'a> {
         let mask = table_size - 1;
         let table = MmapTable::new(table_size).expect("failed to allocate hash table");
 
-        // Insert block-aligned positions. Iterate backwards so that earlier
-        // offsets overwrite later ones with the same hash, biasing toward
-        // matches earlier in the file.
-        //
-        // Software-pipelined: prefetch PIPE_DEPTH entries ahead so that by
-        // the time we insert an entry, its table slot has been in the cache
-        // for ~PIPE_DEPTH iterations (~80-160ns), hiding DRAM latency.
-        const PIPE_DEPTH: usize = 8;
-        let prefill = min(PIPE_DEPTH, num_entries);
-        let mut pipe_hash = [0u64; PIPE_DEPTH];
-        let mut pipe_offset = [0u32; PIPE_DEPTH];
+        // Insert block-aligned positions into the hash table.
+        #[cfg(feature = "parallel")]
+        {
+            // Parallel CAS-based insertion using rayon. Each thread claims
+            // empty slots via compare_exchange — no lost writes, no torn
+            // values. For duplicate blocks, best-effort keeps smallest offset.
+            use rayon::prelude::*;
+            (0..num_entries).into_par_iter().for_each(|i| {
+                let offset = i * block_size;
+                let h = hash_block(&text[offset..offset + block_size]);
+                let packed = pack_entry(offset as u32, h);
+                let needle_tag = (h >> 32) as u32;
+                let block = &text[offset..offset + block_size];
 
-        // Fill the pipeline: compute hashes and issue prefetches
-        for k in 0..prefill {
-            let idx = num_entries - 1 - k;
-            let offset = idx * block_size;
-            let h = hash_block(&text[offset..offset + block_size]);
-            table.prefetch(h as usize & mask);
-            pipe_hash[k] = h;
-            pipe_offset[k] = offset as u32;
+                let mut slot = h as usize & mask;
+                loop {
+                    match table.cas(slot, EMPTY, packed) {
+                        Ok(_) => break, // claimed empty slot
+                        Err(existing) => {
+                            // Tag-first check: only compare text if tags match
+                            if entry_tag(existing) == needle_tag {
+                                let existing_off = entry_offset(existing) as usize;
+                                if &text[existing_off..existing_off + block_size] == block {
+                                    // Duplicate block — keep smaller offset
+                                    if offset < existing_off {
+                                        let _ = table.cas(slot, existing, packed);
+                                    }
+                                    break;
+                                }
+                            }
+                            // Different entry — linear probe to next slot
+                            slot = (slot + 1) & mask;
+                            table.prefetch(slot);
+                        }
+                    }
+                }
+            });
         }
 
-        // Main loop: insert from head of pipeline, refill at tail
-        let mut head = 0;
-        let mut next_idx = num_entries.saturating_sub(PIPE_DEPTH);
-        for _ in 0..num_entries {
-            let h = pipe_hash[head];
-            let offset = pipe_offset[head] as usize;
-            let needle_tag = (h >> 32) as u32;
-            let block = &text[offset..offset + block_size];
+        #[cfg(not(feature = "parallel"))]
+        {
+            // Serial software-pipelined insertion. Iterate backwards so that
+            // earlier offsets overwrite later ones with the same hash, biasing
+            // toward matches earlier in the file. Prefetch PIPE_DEPTH entries
+            // ahead to hide DRAM latency (~100ns per random access).
+            const PIPE_DEPTH: usize = 8;
+            let prefill = min(PIPE_DEPTH, num_entries);
+            let mut pipe_hash = [0u64; PIPE_DEPTH];
+            let mut pipe_offset = [0u32; PIPE_DEPTH];
 
-            // Linear probe to find an empty slot
-            let mut slot = h as usize & mask;
-            loop {
-                let entry = table.get(slot);
-                if entry == EMPTY {
-                    table.set(slot, pack_entry(offset as u32, h));
-                    break;
-                }
-                let next_slot = (slot + 1) & mask;
-                table.prefetch(next_slot);
-                // Tag-first check: only compare text if tags match
-                if entry_tag(entry) == needle_tag {
-                    let existing = entry_offset(entry) as usize;
-                    if &text[existing..existing + block_size] == block {
+            for k in 0..prefill {
+                let idx = num_entries - 1 - k;
+                let offset = idx * block_size;
+                let h = hash_block(&text[offset..offset + block_size]);
+                table.prefetch(h as usize & mask);
+                pipe_hash[k] = h;
+                pipe_offset[k] = offset as u32;
+            }
+
+            let mut head = 0;
+            let mut next_idx = num_entries.saturating_sub(PIPE_DEPTH);
+            for _ in 0..num_entries {
+                let h = pipe_hash[head];
+                let offset = pipe_offset[head] as usize;
+                let needle_tag = (h >> 32) as u32;
+                let block = &text[offset..offset + block_size];
+
+                let mut slot = h as usize & mask;
+                loop {
+                    let entry = table.get(slot);
+                    if entry == EMPTY {
                         table.set(slot, pack_entry(offset as u32, h));
                         break;
                     }
+                    let next_slot = (slot + 1) & mask;
+                    table.prefetch(next_slot);
+                    if entry_tag(entry) == needle_tag {
+                        let existing = entry_offset(entry) as usize;
+                        if &text[existing..existing + block_size] == block {
+                            table.set(slot, pack_entry(offset as u32, h));
+                            break;
+                        }
+                    }
+                    slot = next_slot;
                 }
-                slot = next_slot;
-            }
 
-            // Refill this pipeline slot with the next entry (if any)
-            if next_idx > 0 {
-                next_idx -= 1;
-                let offset = next_idx * block_size;
-                let h = hash_block(&text[offset..offset + block_size]);
-                table.prefetch(h as usize & mask);
-                pipe_hash[head] = h;
-                pipe_offset[head] = offset as u32;
+                if next_idx > 0 {
+                    next_idx -= 1;
+                    let offset = next_idx * block_size;
+                    let h = hash_block(&text[offset..offset + block_size]);
+                    table.prefetch(h as usize & mask);
+                    pipe_hash[head] = h;
+                    pipe_offset[head] = offset as u32;
+                }
+                head = (head + 1) % PIPE_DEPTH;
             }
-            head = (head + 1) % PIPE_DEPTH;
         }
 
         Self {
