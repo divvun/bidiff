@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 mimalloc = "0.1"
 size = "0.5"
-os_pipe = "1"
+ringbuf = "0.4"
 anyhow = "1"
 
 zstd = "0.13"

@@ -1,10 +1,13 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod ring_pipe;
+
 use anyhow::{Context, Result};
 use bidiff::DiffParams;
 use clap::Parser;
 use memmap2::Mmap;
+use ring_pipe::ring_pipe;
 use size::Size;
 use std::{
     fs::File,
@@ -119,19 +122,15 @@ fn do_cycle(
     {
         let mut compatch_w = io::Cursor::new(&mut compatch);
 
-        let (mut patch_r, patch_w) = os_pipe::pipe().unwrap();
+        let (mut patch_r, mut patch_w) = ring_pipe(1024 * 1024);
         let diff_params =
             DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
         std::thread::scope(|s| {
             s.spawn(|| {
-                let mut patch_w = BufWriter::with_capacity(256 * 1024, patch_w);
                 bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch_w, &diff_params)
                     .context("simple diff with params")
                     .unwrap();
                 patch_w.flush().unwrap();
-                // this is important for `.compress()` to finish.
-                // since we're using scoped threads, it's never dropped
-                // otherwise.
                 drop(patch_w);
             });
             let zstd_level = if *max { 22 } else { 3 };
@@ -150,7 +149,7 @@ fn do_cycle(
     {
         let mut older = io::Cursor::new(&older[..]);
 
-        let (patch_r, patch_w) = os_pipe::pipe().unwrap();
+        let (patch_r, patch_w) = ring_pipe(1024 * 1024);
 
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -197,7 +196,7 @@ fn do_patch(
     let start = Instant::now();
 
     let compatch_r = BufReader::new(File::open(patch).context("open patch file")?);
-    let (patch_r, patch_w) = os_pipe::pipe().unwrap();
+    let (patch_r, patch_w) = ring_pipe(1024 * 1024);
 
     std::thread::spawn(move || {
         zstd::stream::copy_decode(compatch_r, patch_w)
@@ -236,11 +235,10 @@ fn do_diff(
     let older_contents = mmap_file(older)?;
     let newer_contents = mmap_file(newer)?;
 
-    let (mut patch_r, patch_w) = os_pipe::pipe().unwrap();
+    let (mut patch_r, mut patch_w) = ring_pipe(1024 * 1024);
     let diff_params = DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
     std::thread::scope(|s| {
         s.spawn(|| {
-            let mut patch_w = BufWriter::with_capacity(256 * 1024, patch_w);
             bidiff::simple_diff_with_params(
                 &older_contents[..],
                 &newer_contents[..],
