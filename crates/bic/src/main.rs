@@ -204,8 +204,9 @@ fn do_patch(
             .unwrap();
     });
 
-    let older_r = File::open(older)?;
-    let mut fresh_r = bipatch::Reader::new(patch_r, older_r).context("read patch")?;
+    let older = mmap_file(older)?;
+    let mut older_cursor = io::Cursor::new(&older[..]);
+    let mut fresh_r = bipatch::Reader::new(patch_r, &mut older_cursor).context("read patch")?;
     let mut output_w = BufWriter::new(File::create(output).context("create patch file")?);
     io::copy(&mut fresh_r, &mut output_w).context("write output file")?;
 
@@ -216,7 +217,11 @@ fn do_patch(
 
 fn mmap_file(path: &PathBuf) -> Result<Mmap> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))
+    let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+        .with_context(|| format!("mmap {}", path.display()))?;
+    #[cfg(unix)]
+    mmap.advise(memmap2::Advice::HugePage).ok();
+    Ok(mmap)
 }
 
 fn do_diff(
