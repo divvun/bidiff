@@ -10,7 +10,7 @@ repository = "https://github.com/divvun/bidiff"
 [features]
 default = ["enc"]
 enc = ["integer-encoding"]
-parallel = ["rayon"]
+parallel = ["rayon", "ringbuf"]
 instructions = []
 profiling = []
 
@@ -21,6 +21,7 @@ integer-encoding = { workspace = true, optional = true }
 # other deps
 tracing.workspace = true
 rayon = { version = "1.11", optional = true }
+ringbuf = { version = "0.4", optional = true }
 memmap2.workspace = true
 tempfile = "3"
 

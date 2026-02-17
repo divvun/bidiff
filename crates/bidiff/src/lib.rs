@@ -8,6 +8,11 @@ use tracing::info;
 
 use hashindex::HashIndex;
 
+#[cfg(feature = "parallel")]
+mod ring_channel;
+#[cfg(feature = "parallel")]
+use ring_channel::{RingProducer, ring_channel};
+
 #[cfg(feature = "profiling")]
 use std::time::Instant;
 
@@ -465,40 +470,49 @@ where
                 chunk_size, num_chunks
             );
 
-            let mut txs = Vec::with_capacity(num_chunks);
-            let mut rxs = Vec::with_capacity(num_chunks);
+            let mut producers = Vec::with_capacity(num_chunks);
+            let mut consumers = Vec::with_capacity(num_chunks);
             for _ in 0..num_chunks {
-                let (tx, rx) = std::sync::mpsc::channel::<Vec<Match>>();
-                txs.push(tx);
-                rxs.push(rx);
+                let (cons, prod) = ring_channel::<Match>(8192);
+                producers.push(prod);
+                consumers.push(cons);
             }
 
-            let do_scan = |txs: Vec<std::sync::mpsc::Sender<Vec<Match>>>| {
-                nbuf.par_chunks(chunk_size).zip(txs).for_each(|(nbuf, tx)| {
-                    let iter = BsdiffIterator::new(obuf, nbuf, &index);
-                    tx.send(iter.collect()).expect("should send results");
-                });
+            let do_scan = |producers: Vec<RingProducer<Match>>| {
+                nbuf.par_chunks(chunk_size)
+                    .zip(producers)
+                    .for_each(|(nbuf, mut prod)| {
+                        for m in BsdiffIterator::new(obuf, nbuf, &index) {
+                            prod.push(m);
+                        }
+                    });
             };
 
-            if let Some(n) = params.num_threads {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build()
-                    .expect("failed to build thread pool");
-                pool.install(|| do_scan(txs));
-            } else {
-                do_scan(txs);
-            }
+            let num_threads = params.num_threads;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    if let Some(n) = num_threads {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(n)
+                            .build()
+                            .expect("failed to build thread pool");
+                        pool.install(|| do_scan(producers));
+                    } else {
+                        do_scan(producers);
+                    }
+                });
 
-            for (i, rx) in rxs.into_iter().enumerate() {
-                let offset = i * chunk_size;
-                let v = rx.recv().expect("should receive results");
-                for mut m in v {
-                    m.add_new_start += offset;
-                    m.copy_end += offset;
-                    on_match(m)?;
+                for (i, mut cons) in consumers.into_iter().enumerate() {
+                    let offset = i * chunk_size;
+                    while let Some(mut m) = cons.pop() {
+                        m.add_new_start += offset;
+                        m.copy_end += offset;
+                        on_match(m)?;
+                    }
                 }
-            }
+
+                Ok::<(), E>(())
+            })?;
         }
     } else {
         for m in BsdiffIterator::new(obuf, nbuf, &index) {
