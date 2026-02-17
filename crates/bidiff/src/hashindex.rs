@@ -68,8 +68,12 @@ mod mmap_table {
         len: usize,
     }
 
-    // MmapTable has sole ownership of the mapping — safe to send/share.
+    // SAFETY: MmapTable has sole ownership of the mapping (private tempfile,
+    // no external references). The backing memory is never aliased.
     unsafe impl Send for MmapTable {}
+    // SAFETY: Concurrent reads are plain loads (no tearing for aligned u64).
+    // Concurrent writes during parallel construction use CAS (atomic).
+    // Serial construction is single-threaded (no concurrent writes).
     unsafe impl Sync for MmapTable {}
 
     impl MmapTable {
@@ -78,6 +82,8 @@ mod mmap_table {
             let byte_len = len * std::mem::size_of::<u64>();
             let file = tempfile::tempfile()?;
             file.set_len(byte_len as u64)?;
+            // SAFETY: Private tempfile — no other process can modify the mapping.
+            // The file handle is dropped after mmap creation; the mapping persists.
             let mut mmap = unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? };
             // File handle dropped here — mapping persists, kernel can page to disk.
 
@@ -97,6 +103,8 @@ mod mmap_table {
         #[inline(always)]
         pub fn get(&self, i: usize) -> u64 {
             debug_assert!(i < self.len);
+            // SAFETY: i < self.len (debug_assert above), mmap is len*8 bytes,
+            // so pointer offset is within the allocation. Aligned u64 read.
             unsafe { (self.mmap.as_ptr() as *const u64).add(i).read() }
         }
 
@@ -104,6 +112,8 @@ mod mmap_table {
         #[cfg_attr(feature = "parallel", allow(dead_code))]
         pub fn set(&self, i: usize, v: u64) {
             debug_assert!(i < self.len);
+            // SAFETY: i < self.len (debug_assert above). Only called from the
+            // serial construction path (single-threaded, no concurrent access).
             unsafe {
                 (self.mmap.as_ptr() as *mut u64).add(i).write(v);
             }
@@ -116,6 +126,8 @@ mod mmap_table {
         pub fn cas(&self, i: usize, expected: u64, new: u64) -> Result<u64, u64> {
             debug_assert!(i < self.len);
             use std::sync::atomic::{AtomicU64, Ordering};
+            // SAFETY: AtomicU64 has identical size (8) and alignment (8) as u64.
+            // The mmap is page-aligned. i < self.len (debug_assert above).
             let atom = unsafe { &*(self.mmap.as_ptr() as *const AtomicU64).add(i) };
             atom.compare_exchange(expected, new, Ordering::Relaxed, Ordering::Relaxed)
         }
@@ -123,14 +135,17 @@ mod mmap_table {
         #[inline(always)]
         pub fn prefetch(&self, i: usize) {
             debug_assert!(i < self.len);
+            // SAFETY: i < self.len (debug_assert above), pointer is within allocation.
             let ptr = unsafe { (self.mmap.as_ptr() as *const u64).add(i) };
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: Prefetch is a CPU hint that cannot cause UB.
+            // Invalid/unmapped addresses are silently ignored by the processor.
             unsafe {
                 std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
             }
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: Same as x86_64 — PRFM is a hint, cannot fault or cause UB.
             unsafe {
-                // PRFM PLDL1KEEP: prefetch for read into L1 cache
                 std::arch::aarch64::_prefetch(ptr as *const i8, 0, 3);
             }
         }
