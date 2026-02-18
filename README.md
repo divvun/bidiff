@@ -46,6 +46,17 @@ Default settings (1 MiB chunks, file-backed hash table). Memory column shows pea
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB | 5.49% | 136ms | 757ms | 18.6 MiB | 730ms | 147 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB | 5.71% | 110ms | 789ms | 16.9 MiB | 751ms | 147 MiB |
 
+### With `--max` (zstd level 22)
+
+Smaller patches at the cost of much slower diff times. Patch application speed is similar.
+
+| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
+|-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
+| Wine 4.18 &rarr; 4.19 | 201 MiB | 203 KiB | 0.10% | 119ms | 3.7s | 60.9 MiB | 4.2s | 189 MiB |
+| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.1 MiB | 0.68% | 518ms | 64.3s | 60.6 MiB | 66.2s | 573 MiB |
+| Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 114ms | 61.5s | 62.5 MiB | 58.5s | 189 MiB |
+| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 92ms | 78.4s | 57.6 MiB | 80.8s | 186 MiB |
+
 ## Workspace structure
 
 - **`bidiff`** (root) -- Library crate. Feature flags:
