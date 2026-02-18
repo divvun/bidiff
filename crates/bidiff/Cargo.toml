@@ -10,7 +10,6 @@ repository = "https://github.com/divvun/bidiff"
 [features]
 default = ["enc"]
 enc = ["integer-encoding", "zstd"]
-parallel = ["rayon", "ringbuf"]
 instructions = []
 profiling = []
 
@@ -23,8 +22,8 @@ zstd = { version = "0.13", optional = true }
 
 # other deps
 tracing.workspace = true
-rayon = { version = "1.11", optional = true }
-ringbuf = { version = "0.4", optional = true }
+rayon = "1.11"
+ringbuf = "0.4"
 memmap2.workspace = true
 tempfile = "3"
 

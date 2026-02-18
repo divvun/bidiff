@@ -80,7 +80,9 @@ mod mmap_table {
         /// Create a new table of `len` u64 slots, all initialized to EMPTY (u64::MAX).
         pub fn new(len: usize) -> io::Result<Self> {
             let byte_len = len * std::mem::size_of::<u64>();
-            let file = tempfile::tempfile()?;
+            // Use current directory (real FS) instead of /tmp (often tmpfs).
+            // On tmpfs, pages can't be paged to disk under memory pressure.
+            let file = tempfile::tempfile_in(".")?;
             file.set_len(byte_len as u64)?;
             // SAFETY: Private tempfile — no other process can modify the mapping.
             // The file handle is dropped after mmap creation; the mapping persists.
@@ -110,7 +112,7 @@ mod mmap_table {
         }
 
         #[inline(always)]
-        #[cfg_attr(feature = "parallel", allow(dead_code))]
+        #[allow(dead_code)]
         pub fn set(&self, i: usize, v: u64) {
             debug_assert!(i < self.len);
             // SAFETY: i < self.len (debug_assert above). Only called from the
@@ -307,7 +309,6 @@ impl<'a> HashIndex<'a> {
             return;
         }
 
-        #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
             (0..num_entries).into_par_iter().for_each(|i| {
@@ -355,65 +356,6 @@ impl<'a> HashIndex<'a> {
                     bucket = (bucket + 1) & self.mask;
                 }
             });
-        }
-
-        #[cfg(not(feature = "parallel"))]
-        {
-            const PIPE_DEPTH: usize = 8;
-            let prefill = min(PIPE_DEPTH, num_entries);
-            let mut pipe_hash = [0u64; PIPE_DEPTH];
-            let mut pipe_offset = [0u32; PIPE_DEPTH];
-
-            for k in 0..prefill {
-                let idx = num_entries - 1 - k;
-                let offset = idx * self.block_size;
-                let h = hash_block(&self.text[offset..offset + self.block_size]);
-                self.table.prefetch((h as usize & self.mask) * BUCKET_SIZE);
-                pipe_hash[k] = h;
-                pipe_offset[k] = offset as u32;
-            }
-
-            let mut head = 0;
-            let mut next_idx = num_entries.saturating_sub(PIPE_DEPTH);
-            for _ in 0..num_entries {
-                let h = pipe_hash[head];
-                let offset = pipe_offset[head] as usize;
-                let packed = pack_entry(offset as u32, h);
-                let needle_tag = (h >> 32) as u32;
-                let block = &self.text[offset..offset + self.block_size];
-
-                let mut bucket = h as usize & self.mask;
-                'insert: loop {
-                    let base = bucket * BUCKET_SIZE;
-                    for slot in base..base + BUCKET_SIZE {
-                        let entry = self.table.get(slot);
-                        if entry == EMPTY {
-                            self.table.set(slot, packed);
-                            break 'insert;
-                        }
-                        if entry_tag(entry) == needle_tag {
-                            let existing = entry_offset(entry) as usize;
-                            if &self.text[existing..existing + self.block_size] == block {
-                                self.table.set(slot, packed);
-                                break 'insert;
-                            }
-                        }
-                    }
-                    // Bucket full, overflow to next
-                    bucket = (bucket + 1) & self.mask;
-                    self.table.prefetch(bucket * BUCKET_SIZE);
-                }
-
-                if next_idx > 0 {
-                    next_idx -= 1;
-                    let offset = next_idx * self.block_size;
-                    let h = hash_block(&self.text[offset..offset + self.block_size]);
-                    self.table.prefetch((h as usize & self.mask) * BUCKET_SIZE);
-                    pipe_hash[head] = h;
-                    pipe_offset[head] = offset as u32;
-                }
-                head = (head + 1) % PIPE_DEPTH;
-            }
         }
     }
 

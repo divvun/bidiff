@@ -8,7 +8,7 @@ edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
 [dependencies]
-bidiff = { path = "../bidiff", features = ["enc", "parallel"] }
+bidiff = { path = "../bidiff", features = ["enc"] }
 bipatch = { path = "../bipatch" }
 
 memmap2.workspace = true

@@ -1,16 +1,12 @@
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 #[cfg(feature = "enc")]
 use std::io::{self, Write};
 use std::{cmp::min, error::Error};
-#[cfg(any(feature = "enc", feature = "parallel"))]
 use tracing::info;
 
 use hashindex::HashIndex;
 
-#[cfg(feature = "parallel")]
 mod ring_channel;
-#[cfg(feature = "parallel")]
 use ring_channel::{RingProducer, ring_channel};
 
 #[cfg(feature = "profiling")]
@@ -376,11 +372,8 @@ pub struct DiffParams {
     /// Block size for hash index (default 32). Must be >= 4.
     pub block_size: usize,
     /// Only used when the `parallel` feature is enabled.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) scan_chunk_size: Option<usize>,
     /// Max threads for parallel scanning. `None` = use all available cores.
-    /// Only used when the `parallel` feature is enabled and `scan_chunk_size` is set.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) num_threads: Option<usize>,
 }
 
@@ -454,66 +447,57 @@ where
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
 
-    #[cfg(feature = "parallel")]
-    let use_parallel = params.scan_chunk_size.is_some();
-    #[cfg(not(feature = "parallel"))]
-    let use_parallel = false;
+    if let Some(chunk_size) = params.scan_chunk_size {
+        let num_chunks = nbuf.len().div_ceil(chunk_size);
 
-    if use_parallel {
-        #[cfg(feature = "parallel")]
-        {
-            let chunk_size = params.scan_chunk_size.unwrap();
-            let num_chunks = nbuf.len().div_ceil(chunk_size);
+        info!(
+            "scanning with {}B chunks... ({} chunks total)",
+            chunk_size, num_chunks
+        );
 
-            info!(
-                "scanning with {}B chunks... ({} chunks total)",
-                chunk_size, num_chunks
-            );
+        let mut producers = Vec::with_capacity(num_chunks);
+        let mut consumers = Vec::with_capacity(num_chunks);
+        for _ in 0..num_chunks {
+            let (cons, prod) = ring_channel::<Match>(8192);
+            producers.push(prod);
+            consumers.push(cons);
+        }
 
-            let mut producers = Vec::with_capacity(num_chunks);
-            let mut consumers = Vec::with_capacity(num_chunks);
-            for _ in 0..num_chunks {
-                let (cons, prod) = ring_channel::<Match>(8192);
-                producers.push(prod);
-                consumers.push(cons);
-            }
-
-            let do_scan = |producers: Vec<RingProducer<Match>>| {
-                nbuf.par_chunks(chunk_size)
-                    .zip(producers)
-                    .for_each(|(nbuf, mut prod)| {
-                        for m in BsdiffIterator::new(obuf, nbuf, &index) {
-                            prod.push(m);
-                        }
-                    });
-            };
-
-            let num_threads = params.num_threads;
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    if let Some(n) = num_threads {
-                        let pool = rayon::ThreadPoolBuilder::new()
-                            .num_threads(n)
-                            .build()
-                            .expect("failed to build thread pool");
-                        pool.install(|| do_scan(producers));
-                    } else {
-                        do_scan(producers);
+        let do_scan = |producers: Vec<RingProducer<Match>>| {
+            nbuf.par_chunks(chunk_size)
+                .zip(producers)
+                .for_each(|(nbuf, mut prod)| {
+                    for m in BsdiffIterator::new(obuf, nbuf, &index) {
+                        prod.push(m);
                     }
                 });
+        };
 
-                for (i, mut cons) in consumers.into_iter().enumerate() {
-                    let offset = i * chunk_size;
-                    while let Some(mut m) = cons.pop() {
-                        m.add_new_start += offset;
-                        m.copy_end += offset;
-                        on_match(m)?;
-                    }
+        let num_threads = params.num_threads;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                if let Some(n) = num_threads {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n)
+                        .build()
+                        .expect("failed to build thread pool");
+                    pool.install(|| do_scan(producers));
+                } else {
+                    do_scan(producers);
                 }
+            });
 
-                Ok::<(), E>(())
-            })?;
-        }
+            for (i, mut cons) in consumers.into_iter().enumerate() {
+                let offset = i * chunk_size;
+                while let Some(mut m) = cons.pop() {
+                    m.add_new_start += offset;
+                    m.copy_end += offset;
+                    on_match(m)?;
+                }
+            }
+
+            Ok::<(), E>(())
+        })?;
     } else {
         for m in BsdiffIterator::new(obuf, nbuf, &index) {
             on_match(m)?
@@ -612,67 +596,58 @@ where
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
 
-    #[cfg(feature = "parallel")]
-    let use_parallel = params.scan_chunk_size.is_some();
-    #[cfg(not(feature = "parallel"))]
-    let use_parallel = false;
+    if let Some(chunk_size) = params.scan_chunk_size {
+        let num_chunks = nbuf.len().div_ceil(chunk_size);
 
-    if use_parallel {
-        #[cfg(feature = "parallel")]
-        {
-            let chunk_size = params.scan_chunk_size.unwrap();
-            let num_chunks = nbuf.len().div_ceil(chunk_size);
+        info!(
+            "scanning with {}B chunks... ({} chunks total)",
+            chunk_size, num_chunks
+        );
 
-            info!(
-                "scanning with {}B chunks... ({} chunks total)",
-                chunk_size, num_chunks
-            );
+        let mut producers = Vec::with_capacity(num_chunks);
+        let mut consumers = Vec::with_capacity(num_chunks);
+        for _ in 0..num_chunks {
+            let (cons, prod) = ring_channel::<Match>(8192);
+            producers.push(prod);
+            consumers.push(cons);
+        }
 
-            let mut producers = Vec::with_capacity(num_chunks);
-            let mut consumers = Vec::with_capacity(num_chunks);
-            for _ in 0..num_chunks {
-                let (cons, prod) = ring_channel::<Match>(8192);
-                producers.push(prod);
-                consumers.push(cons);
-            }
-
-            let do_scan = |producers: Vec<RingProducer<Match>>| {
-                nbuf.par_chunks(chunk_size)
-                    .zip(producers)
-                    .for_each(|(nbuf, mut prod)| {
-                        for m in BsdiffIterator::new(obuf, nbuf, &index) {
-                            prod.push(m);
-                        }
-                    });
-            };
-
-            let num_threads = params.num_threads;
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    if let Some(n) = num_threads {
-                        let pool = rayon::ThreadPoolBuilder::new()
-                            .num_threads(n)
-                            .build()
-                            .expect("failed to build thread pool");
-                        pool.install(|| do_scan(producers));
-                    } else {
-                        do_scan(producers);
+        let do_scan = |producers: Vec<RingProducer<Match>>| {
+            nbuf.par_chunks(chunk_size)
+                .zip(producers)
+                .for_each(|(nbuf, mut prod)| {
+                    for m in BsdiffIterator::new(obuf, nbuf, &index) {
+                        prod.push(m);
                     }
                 });
+        };
 
-                for (i, mut cons) in consumers.into_iter().enumerate() {
-                    let start = i * chunk_size;
-                    let end = (start + chunk_size).min(nbuf.len());
-                    let chunk_nbuf = &nbuf[start..end];
-                    let mut iter = std::iter::from_fn(|| cons.pop());
-                    on_chunk(i, chunk_nbuf, &mut iter, &index)?;
+        let num_threads = params.num_threads;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                if let Some(n) = num_threads {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n)
+                        .build()
+                        .expect("failed to build thread pool");
+                    pool.install(|| do_scan(producers));
+                } else {
+                    do_scan(producers);
                 }
+            });
 
-                Ok::<(), E>(())
-            })?;
-        }
+            for (i, mut cons) in consumers.into_iter().enumerate() {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(nbuf.len());
+                let chunk_nbuf = &nbuf[start..end];
+                let mut iter = std::iter::from_fn(|| cons.pop());
+                on_chunk(i, chunk_nbuf, &mut iter, &index)?;
+            }
+
+            Ok::<(), E>(())
+        })?;
     } else {
-        // Non-parallel path: must populate fully before scanning.
+        // Non-chunked path: single-threaded scan.
         index.populate();
         let mut iter = BsdiffIterator::new(obuf, nbuf, &index);
         on_chunk(0, nbuf, &mut iter, &index)?;
