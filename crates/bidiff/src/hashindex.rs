@@ -84,19 +84,20 @@ mod mmap_table {
             file.set_len(byte_len as u64)?;
             // SAFETY: Private tempfile — no other process can modify the mapping.
             // The file handle is dropped after mmap creation; the mapping persists.
-            let mut mmap = unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? };
+            let mmap = unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? };
             // File handle dropped here — mapping persists, kernel can page to disk.
 
-            // Request transparent huge pages on Linux to reduce TLB pressure
-            // for the random access pattern of hash table probing.
+            // EMPTY = 0, so kernel-zeroed pages are already initialized.
+            // No memset needed — saves ~100ms for large tables.
             #[cfg(target_os = "linux")]
             {
                 use memmap2::Advice;
+                // Request transparent huge pages to reduce TLB pressure.
                 let _ = mmap.advise(Advice::HugePage);
+                // Random access pattern — disable kernel readahead.
+                let _ = mmap.advise(Advice::Random);
             }
 
-            // Fill with EMPTY sentinel (u64::MAX = all 0xFF bytes).
-            mmap.fill(0xFF);
             Ok(Self { mmap, len })
         }
 
@@ -172,25 +173,32 @@ use mmap_table::MmapTable;
 pub struct HashIndex<'a> {
     text: &'a [u8],
     block_size: usize,
-    /// Hash table using open addressing with linear probing.
-    /// Each slot stores a packed u64: upper 32 bits = hash tag, lower 32 bits = offset.
-    /// EMPTY (u64::MAX) = empty slot.
+    /// Cache-line-aligned bucket hash table. Each bucket is 8 packed u64 entries
+    /// = 64 bytes = 1 cache line. Hash → bucket index, scan all 8 entries in one
+    /// DRAM fetch. Overflow probes to next bucket (rare at ~42% load).
     table: MmapTable,
     mask: usize,
 }
 
-const EMPTY: u64 = u64::MAX;
+/// EMPTY = 0: kernel-zeroed mmap pages are born initialized, no memset needed.
+/// Valid entries always have lower 32 bits >= 1 (we store offset+1).
+const EMPTY: u64 = 0;
+
+/// 8 entries per bucket = 8 × 8 bytes = 64 bytes = 1 cache line.
+/// A single DRAM fetch loads the entire bucket's probe sequence.
+const BUCKET_SIZE: usize = 8;
 
 /// Pack a u32 offset and the upper 32 bits of the hash into a single u64.
+/// Stores offset+1 so that EMPTY (0) is unambiguous.
 #[inline(always)]
 fn pack_entry(offset: u32, hash: u64) -> u64 {
-    (hash & 0xFFFF_FFFF_0000_0000) | offset as u64
+    (hash & 0xFFFF_FFFF_0000_0000) | (offset as u64 + 1)
 }
 
 /// Extract the u32 offset from a packed entry.
 #[inline(always)]
 fn entry_offset(entry: u64) -> u32 {
-    entry as u32
+    (entry as u32) - 1
 }
 
 /// Extract the 32-bit tag from a packed entry.
@@ -240,80 +248,117 @@ impl<'a> HashIndex<'a> {
     /// The block size controls the granularity of matching. Smaller blocks find
     /// more matches but use more memory. 32 bytes is a good default.
     pub fn new(text: &'a [u8], block_size: usize) -> Self {
+        let index = Self::new_empty(text, block_size);
+        index.populate();
+        index
+    }
+
+    /// Allocate an empty hash index (table created but no entries inserted).
+    /// Call `populate()` to insert entries. Lookups on an unpopulated index
+    /// return no matches.
+    pub fn new_empty(text: &'a [u8], block_size: usize) -> Self {
         assert!(block_size >= 4, "block_size must be at least 4");
 
         if text.len() < block_size {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(2).expect("failed to allocate hash table"),
-                mask: 1,
+                table: MmapTable::new(BUCKET_SIZE).expect("failed to allocate hash table"),
+                mask: 0, // 1 bucket
             };
         }
 
-        // Index every block_size-th byte position (block-aligned).
         let num_entries = text.len() / block_size;
         if num_entries == 0 {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(2).expect("failed to allocate hash table"),
-                mask: 1,
+                table: MmapTable::new(BUCKET_SIZE).expect("failed to allocate hash table"),
+                mask: 0, // 1 bucket
             };
         }
 
-        // Size table to ~2x the number of entries (~50% load factor).
-        // With linear probing this gives average probe length ~1.5 (successful)
-        // and ~2.5 (unsuccessful), reducing cache misses on lookup.
-        let table_size = (num_entries * 2).next_power_of_two().max(2);
-        let mask = table_size - 1;
+        // Bucket mask: num_buckets is a power of 2, mask = num_buckets - 1.
+        // 50% load factor: num_entries * 2 total slots, divided into buckets.
+        let num_buckets = (num_entries * 2)
+            .div_ceil(BUCKET_SIZE)
+            .next_power_of_two()
+            .max(1);
+        let table_size = num_buckets * BUCKET_SIZE;
+        let mask = num_buckets - 1;
         let table = MmapTable::new(table_size).expect("failed to allocate hash table");
 
-        // Insert block-aligned positions into the hash table.
+        Self {
+            text,
+            block_size,
+            table,
+            mask,
+        }
+    }
+
+    /// Insert all block-aligned positions into the hash table.
+    ///
+    /// Safe to call concurrently with lookups: the CAS-based insertion ensures
+    /// consistent slot states. Lookups during population may miss entries not yet
+    /// inserted (resulting in missed matches, not wrong matches).
+    pub fn populate(&self) {
+        let num_entries = self.text.len() / self.block_size;
+        if num_entries == 0 {
+            return;
+        }
+
         #[cfg(feature = "parallel")]
         {
-            // Parallel CAS-based insertion using rayon. Each thread claims
-            // empty slots via compare_exchange — no lost writes, no torn
-            // values. For duplicate blocks, best-effort keeps smallest offset.
             use rayon::prelude::*;
             (0..num_entries).into_par_iter().for_each(|i| {
-                let offset = i * block_size;
-                let h = hash_block(&text[offset..offset + block_size]);
+                let offset = i * self.block_size;
+                let h = hash_block(&self.text[offset..offset + self.block_size]);
                 let packed = pack_entry(offset as u32, h);
                 let needle_tag = (h >> 32) as u32;
-                let block = &text[offset..offset + block_size];
+                let block = &self.text[offset..offset + self.block_size];
 
-                let mut slot = h as usize & mask;
+                let mut bucket = h as usize & self.mask;
                 loop {
-                    match table.cas(slot, EMPTY, packed) {
-                        Ok(_) => break, // claimed empty slot
-                        Err(existing) => {
-                            // Tag-first check: only compare text if tags match
-                            if entry_tag(existing) == needle_tag {
-                                let existing_off = entry_offset(existing) as usize;
-                                if &text[existing_off..existing_off + block_size] == block {
-                                    // Duplicate block — keep smaller offset
-                                    if offset < existing_off {
-                                        let _ = table.cas(slot, existing, packed);
+                    let base = bucket * BUCKET_SIZE;
+                    for slot in base..base + BUCKET_SIZE {
+                        let entry = self.table.get(slot);
+                        if entry == EMPTY {
+                            match self.table.cas(slot, EMPTY, packed) {
+                                Ok(_) => return,
+                                Err(existing) => {
+                                    // Slot claimed by another thread — check duplicate
+                                    if entry_tag(existing) == needle_tag {
+                                        let existing_off = entry_offset(existing) as usize;
+                                        if &self.text[existing_off..existing_off + self.block_size]
+                                            == block
+                                        {
+                                            if offset < existing_off {
+                                                let _ = self.table.cas(slot, existing, packed);
+                                            }
+                                            return;
+                                        }
                                     }
-                                    break;
+                                    // Not a duplicate — continue scanning bucket
                                 }
                             }
-                            // Different entry — linear probe to next slot
-                            slot = (slot + 1) & mask;
-                            table.prefetch(slot);
+                        } else if entry_tag(entry) == needle_tag {
+                            let existing_off = entry_offset(entry) as usize;
+                            if &self.text[existing_off..existing_off + self.block_size] == block {
+                                if offset < existing_off {
+                                    let _ = self.table.cas(slot, entry, packed);
+                                }
+                                return;
+                            }
                         }
                     }
+                    // Bucket full, overflow to next bucket
+                    bucket = (bucket + 1) & self.mask;
                 }
             });
         }
 
         #[cfg(not(feature = "parallel"))]
         {
-            // Serial software-pipelined insertion. Iterate backwards so that
-            // earlier offsets overwrite later ones with the same hash, biasing
-            // toward matches earlier in the file. Prefetch PIPE_DEPTH entries
-            // ahead to hide DRAM latency (~100ns per random access).
             const PIPE_DEPTH: usize = 8;
             let prefill = min(PIPE_DEPTH, num_entries);
             let mut pipe_hash = [0u64; PIPE_DEPTH];
@@ -321,9 +366,9 @@ impl<'a> HashIndex<'a> {
 
             for k in 0..prefill {
                 let idx = num_entries - 1 - k;
-                let offset = idx * block_size;
-                let h = hash_block(&text[offset..offset + block_size]);
-                table.prefetch(h as usize & mask);
+                let offset = idx * self.block_size;
+                let h = hash_block(&self.text[offset..offset + self.block_size]);
+                self.table.prefetch((h as usize & self.mask) * BUCKET_SIZE);
                 pipe_hash[k] = h;
                 pipe_offset[k] = offset as u32;
             }
@@ -333,45 +378,42 @@ impl<'a> HashIndex<'a> {
             for _ in 0..num_entries {
                 let h = pipe_hash[head];
                 let offset = pipe_offset[head] as usize;
+                let packed = pack_entry(offset as u32, h);
                 let needle_tag = (h >> 32) as u32;
-                let block = &text[offset..offset + block_size];
+                let block = &self.text[offset..offset + self.block_size];
 
-                let mut slot = h as usize & mask;
-                loop {
-                    let entry = table.get(slot);
-                    if entry == EMPTY {
-                        table.set(slot, pack_entry(offset as u32, h));
-                        break;
-                    }
-                    let next_slot = (slot + 1) & mask;
-                    table.prefetch(next_slot);
-                    if entry_tag(entry) == needle_tag {
-                        let existing = entry_offset(entry) as usize;
-                        if &text[existing..existing + block_size] == block {
-                            table.set(slot, pack_entry(offset as u32, h));
-                            break;
+                let mut bucket = h as usize & self.mask;
+                'insert: loop {
+                    let base = bucket * BUCKET_SIZE;
+                    for slot in base..base + BUCKET_SIZE {
+                        let entry = self.table.get(slot);
+                        if entry == EMPTY {
+                            self.table.set(slot, packed);
+                            break 'insert;
+                        }
+                        if entry_tag(entry) == needle_tag {
+                            let existing = entry_offset(entry) as usize;
+                            if &self.text[existing..existing + self.block_size] == block {
+                                self.table.set(slot, packed);
+                                break 'insert;
+                            }
                         }
                     }
-                    slot = next_slot;
+                    // Bucket full, overflow to next
+                    bucket = (bucket + 1) & self.mask;
+                    self.table.prefetch(bucket * BUCKET_SIZE);
                 }
 
                 if next_idx > 0 {
                     next_idx -= 1;
-                    let offset = next_idx * block_size;
-                    let h = hash_block(&text[offset..offset + block_size]);
-                    table.prefetch(h as usize & mask);
+                    let offset = next_idx * self.block_size;
+                    let h = hash_block(&self.text[offset..offset + self.block_size]);
+                    self.table.prefetch((h as usize & self.mask) * BUCKET_SIZE);
                     pipe_hash[head] = h;
                     pipe_offset[head] = offset as u32;
                 }
                 head = (head + 1) % PIPE_DEPTH;
             }
-        }
-
-        Self {
-            text,
-            block_size,
-            table,
-            mask,
         }
     }
 
@@ -386,29 +428,36 @@ impl<'a> HashIndex<'a> {
 
     /// Look up a block using a pre-computed hash, avoiding redundant hashing
     /// when the hash was already computed by prefetch_block.
+    ///
+    /// Bucket hashing: hash → bucket index, scan all 8 entries in the bucket
+    /// (1 cache line = 1 DRAM fetch). Entries are packed from the front, so
+    /// the first EMPTY slot means the entry isn't in this or any later bucket.
     #[inline(always)]
     fn lookup_with_hash(&self, block: &[u8], h: u64) -> Option<usize> {
         let needle_tag = (h >> 32) as u32;
-        let mut slot = h as usize & self.mask;
+        let mut bucket = h as usize & self.mask;
         let mut probes = 0;
         loop {
-            let entry = self.table.get(slot);
-            if entry == EMPTY {
-                return None;
-            }
-            let next_slot = (slot + 1) & self.mask;
-            self.table.prefetch(next_slot);
-            if entry_tag(entry) == needle_tag {
-                let o = entry_offset(entry) as usize;
-                if &self.text[o..o + self.block_size] == block {
-                    return Some(o);
+            let base = bucket * BUCKET_SIZE;
+            for i in 0..BUCKET_SIZE {
+                let entry = self.table.get(base + i);
+                if entry == EMPTY {
+                    return None;
+                }
+                if entry_tag(entry) == needle_tag {
+                    let o = entry_offset(entry) as usize;
+                    if &self.text[o..o + self.block_size] == block {
+                        return Some(o);
+                    }
                 }
             }
+            // Bucket full with no match — probe next bucket (rare at 50% load)
             probes += 1;
-            if probes > 32 {
-                return None; // give up after too many probes
+            if probes > 4 {
+                return None;
             }
-            slot = next_slot;
+            bucket = (bucket + 1) & self.mask;
+            self.table.prefetch(bucket * BUCKET_SIZE);
         }
     }
 }
@@ -420,8 +469,8 @@ impl<'a> HashIndex<'a> {
     pub fn prefetch_block(&self, data: &[u8]) -> Option<u64> {
         if data.len() >= self.block_size {
             let h = hash_block(&data[..self.block_size]);
-            let slot = h as usize & self.mask;
-            self.table.prefetch(slot);
+            let bucket = h as usize & self.mask;
+            self.table.prefetch(bucket * BUCKET_SIZE);
             Some(h)
         } else {
             None

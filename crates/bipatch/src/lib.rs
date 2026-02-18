@@ -170,28 +170,45 @@ pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], output: &mut [u8]) -> io::R
     let mut old_pos = chunk.old_start as usize;
     let mut out_pos: usize = 0;
 
-    while let Some(add_len) = read_varint_slice::<usize>(&ctrl, &mut pos) {
-        // ADD: fused read + wrapping_add in one pass (single cache pass over output)
+    while let Some(add_tag) = read_varint_slice::<usize>(&ctrl, &mut pos) {
+        let add_len = add_tag >> 1;
         if add_len > 0 {
-            let delta = &ctrl[pos..pos + add_len];
-            let old_slice = &old[old_pos..old_pos + add_len];
-            let out_slice = &mut output[out_pos..out_pos + add_len];
-            for i in 0..add_len {
-                out_slice[i] = delta[i].wrapping_add(old_slice[i]);
+            if add_tag & 1 == 0 {
+                // Normal ADD: fused delta + wrapping_add
+                let delta = &ctrl[pos..pos + add_len];
+                let old_slice = &old[old_pos..old_pos + add_len];
+                let out_slice = &mut output[out_pos..out_pos + add_len];
+                for i in 0..add_len {
+                    out_slice[i] = delta[i].wrapping_add(old_slice[i]);
+                }
+                pos += add_len;
+            } else {
+                // ZERO-COPY: memcpy from old, no delta bytes in stream
+                output[out_pos..out_pos + add_len]
+                    .copy_from_slice(&old[old_pos..old_pos + add_len]);
             }
-            pos += add_len;
             old_pos += add_len;
             out_pos += add_len;
         }
 
-        // Read copy_len
-        let copy_len: usize = read_varint_slice(&ctrl, &mut pos)
-            .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "truncated copy_len"))?;
+        // Read copy_tag (LSB = 0: literal, LSB = 1: copy-from-old)
+        let copy_tag: usize = read_varint_slice(&ctrl, &mut pos)
+            .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "truncated copy_tag"))?;
+        let copy_len = copy_tag >> 1;
 
-        // COPY: memcpy from control stream into output
         if copy_len > 0 {
-            output[out_pos..out_pos + copy_len].copy_from_slice(&ctrl[pos..pos + copy_len]);
-            pos += copy_len;
+            if copy_tag & 1 == 0 {
+                // Literal COPY: bytes from control stream
+                output[out_pos..out_pos + copy_len].copy_from_slice(&ctrl[pos..pos + copy_len]);
+                pos += copy_len;
+            } else {
+                // COPY_OLD: bytes from old file at specified position
+                let old_copy_pos: usize = read_varint_slice(&ctrl, &mut pos).ok_or_else(|| {
+                    io::Error::new(ErrorKind::UnexpectedEof, "truncated copy_old pos")
+                })?;
+                output[out_pos..out_pos + copy_len]
+                    .copy_from_slice(&old[old_copy_pos..old_copy_pos + copy_len]);
+            }
             out_pos += copy_len;
         }
 

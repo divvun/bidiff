@@ -250,7 +250,11 @@ fn do_diff(
     let start = Instant::now();
 
     let older_contents = mmap_file(older)?;
+    #[cfg(unix)]
+    older_contents.advise(memmap2::Advice::Random).ok();
     let newer_contents = mmap_file(newer)?;
+    #[cfg(unix)]
+    newer_contents.advise(memmap2::Advice::Sequential).ok();
 
     let diff_params = DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
     let zstd_level = if *max { 22 } else { 3 };

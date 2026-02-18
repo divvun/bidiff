@@ -189,16 +189,16 @@ impl<'a> Iterator for BsdiffIterator<'a> {
                 } else {
                     self.sa.longest_substring_match(&self.nbuf[self.scan..])
                 };
-                // Prefetch the table slot for the next scan position and cache the hash.
+                // Prefetch the table bucket for the next scan position and cache the hash.
                 // The oldscore + scoring work below provides the latency window.
                 self.cached_hash = if self.scan + 1 < nbuflen {
                     self.sa.prefetch_block(&self.nbuf[self.scan + 1..])
                 } else {
                     None
                 };
-                // Lookahead prefetches: warm table slots for scan+2 and scan+3.
-                // We don't cache these hashes — recomputation is cheap
-                // vs the DRAM latency we avoid by having warm cache lines.
+                // Lookahead prefetches: warm table buckets for upcoming scan positions.
+                // We don't cache these hashes — the CPU pipelines the independent
+                // hash computations via out-of-order execution, so recomputation is free.
                 if self.scan + 2 < nbuflen {
                     self.sa.prefetch_block(&self.nbuf[self.scan + 2..]);
                 }
@@ -587,7 +587,7 @@ pub fn simple_diff_with_params(
     simple_diff_chunked_with_params(older, newer, out, diff_params, 3)
 }
 
-/// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches)` per chunk
+/// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches, hash_index)` per chunk
 /// with chunk-relative match positions (add_new_start/copy_end NOT offset-adjusted).
 pub fn diff_chunked<F, E>(
     obuf: &[u8],
@@ -596,7 +596,7 @@ pub fn diff_chunked<F, E>(
     mut on_chunk: F,
 ) -> Result<(), E>
 where
-    F: FnMut(usize, &[u8], &mut dyn Iterator<Item = Match>) -> Result<(), E>,
+    F: FnMut(usize, &[u8], &mut dyn Iterator<Item = Match>, &HashIndex) -> Result<(), E>,
 {
     #[cfg(feature = "profiling")]
     let before_index = Instant::now();
@@ -665,15 +665,17 @@ where
                     let end = (start + chunk_size).min(nbuf.len());
                     let chunk_nbuf = &nbuf[start..end];
                     let mut iter = std::iter::from_fn(|| cons.pop());
-                    on_chunk(i, chunk_nbuf, &mut iter)?;
+                    on_chunk(i, chunk_nbuf, &mut iter, &index)?;
                 }
 
                 Ok::<(), E>(())
             })?;
         }
     } else {
+        // Non-parallel path: must populate fully before scanning.
+        index.populate();
         let mut iter = BsdiffIterator::new(obuf, nbuf, &index);
-        on_chunk(0, nbuf, &mut iter)?;
+        on_chunk(0, nbuf, &mut iter, &index)?;
     }
 
     #[cfg(feature = "profiling")]
@@ -707,45 +709,51 @@ pub fn simple_diff_chunked_with_params(
     out.write_all(&(newer.len() as u64).to_le_bytes())?;
     out.write_all(&(num_chunks as u32).to_le_bytes())?;
 
-    diff_chunked(older, newer, diff_params, |i, chunk_nbuf, matches| {
-        let new_start = i * chunk_size;
-        let new_len = chunk_nbuf.len();
+    diff_chunked(
+        older,
+        newer,
+        diff_params,
+        |i, chunk_nbuf, matches, _index| {
+            let new_start = i * chunk_size;
+            let new_len = chunk_nbuf.len();
 
-        // Collect sub-patch Controls into a buffer
-        let mut sub_patch = Vec::new();
-        let mut w = enc::Writer::new_raw(&mut sub_patch);
-        let mut first_old_start: u64 = 0;
-        let mut is_first = true;
+            // Collect sub-patch Controls into a buffer
+            let mut sub_patch = Vec::new();
+            let mut w = enc::Writer::new_raw(&mut sub_patch);
+            let mut first_old_start: u64 = 0;
+            let mut is_first = true;
 
-        let mut translator =
-            Translator::new(older, chunk_nbuf, |control| -> Result<(), io::Error> {
-                w.write(control)
-            });
+            let mut translator =
+                Translator::new(older, chunk_nbuf, |control| -> Result<(), io::Error> {
+                    w.write_extended(control, None)
+                });
 
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(m) = matches.next() {
-            if is_first {
-                first_old_start = m.add_old_start as u64;
-                is_first = false;
+            #[allow(clippy::while_let_on_iterator)]
+            while let Some(m) = matches.next() {
+                if is_first {
+                    first_old_start = m.add_old_start as u64;
+                    is_first = false;
+                }
+                translator.translate(m)?;
             }
-            translator.translate(m)?;
-        }
-        translator.close()?;
+            translator.close()?;
 
-        // Compress sub-patch independently
-        let raw_len = sub_patch.len() as u64;
-        let compressed = zstd::bulk::compress(&sub_patch, zstd_level).map_err(io::Error::other)?;
+            // Compress sub-patch independently
+            let raw_len = sub_patch.len() as u64;
+            let compressed =
+                zstd::bulk::compress(&sub_patch, zstd_level).map_err(io::Error::other)?;
 
-        // Write chunk metadata + compressed data
-        out.write_all(&first_old_start.to_le_bytes())?;
-        out.write_all(&(new_start as u64).to_le_bytes())?;
-        out.write_all(&(new_len as u64).to_le_bytes())?;
-        out.write_all(&raw_len.to_le_bytes())?;
-        out.write_all(&(compressed.len() as u64).to_le_bytes())?;
-        out.write_all(&compressed)?;
+            // Write chunk metadata + compressed data
+            out.write_all(&first_old_start.to_le_bytes())?;
+            out.write_all(&(new_start as u64).to_le_bytes())?;
+            out.write_all(&(new_len as u64).to_le_bytes())?;
+            out.write_all(&raw_len.to_le_bytes())?;
+            out.write_all(&(compressed.len() as u64).to_le_bytes())?;
+            out.write_all(&compressed)?;
 
-        Ok::<(), io::Error>(())
-    })?;
+            Ok::<(), io::Error>(())
+        },
+    )?;
 
     Ok(())
 }
