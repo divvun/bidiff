@@ -584,11 +584,168 @@ pub fn simple_diff_with_params(
     out: &mut dyn Write,
     diff_params: &DiffParams,
 ) -> Result<(), io::Error> {
-    let mut w = enc::Writer::new(out)?;
+    simple_diff_chunked_with_params(older, newer, out, diff_params, 3)
+}
 
-    let mut translator = Translator::new(older, newer, |control| w.write(control));
-    diff(older, newer, diff_params, |m| translator.translate(m))?;
-    translator.close()?;
+/// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches)` per chunk
+/// with chunk-relative match positions (add_new_start/copy_end NOT offset-adjusted).
+pub fn diff_chunked<F, E>(
+    obuf: &[u8],
+    nbuf: &[u8],
+    params: &DiffParams,
+    mut on_chunk: F,
+) -> Result<(), E>
+where
+    F: FnMut(usize, &[u8], &mut dyn Iterator<Item = Match>) -> Result<(), E>,
+{
+    #[cfg(feature = "profiling")]
+    let before_index = Instant::now();
+
+    let index = HashIndex::new(obuf, params.block_size);
+
+    #[cfg(feature = "profiling")]
+    info!(
+        "index build took {}",
+        DurationSpeed(obuf.len() as u64, before_index.elapsed())
+    );
+
+    #[cfg(feature = "profiling")]
+    let before_scan = Instant::now();
+
+    #[cfg(feature = "parallel")]
+    let use_parallel = params.scan_chunk_size.is_some();
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
+
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            let chunk_size = params.scan_chunk_size.unwrap();
+            let num_chunks = nbuf.len().div_ceil(chunk_size);
+
+            info!(
+                "scanning with {}B chunks... ({} chunks total)",
+                chunk_size, num_chunks
+            );
+
+            let mut producers = Vec::with_capacity(num_chunks);
+            let mut consumers = Vec::with_capacity(num_chunks);
+            for _ in 0..num_chunks {
+                let (cons, prod) = ring_channel::<Match>(8192);
+                producers.push(prod);
+                consumers.push(cons);
+            }
+
+            let do_scan = |producers: Vec<RingProducer<Match>>| {
+                nbuf.par_chunks(chunk_size)
+                    .zip(producers)
+                    .for_each(|(nbuf, mut prod)| {
+                        for m in BsdiffIterator::new(obuf, nbuf, &index) {
+                            prod.push(m);
+                        }
+                    });
+            };
+
+            let num_threads = params.num_threads;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    if let Some(n) = num_threads {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(n)
+                            .build()
+                            .expect("failed to build thread pool");
+                        pool.install(|| do_scan(producers));
+                    } else {
+                        do_scan(producers);
+                    }
+                });
+
+                for (i, mut cons) in consumers.into_iter().enumerate() {
+                    let start = i * chunk_size;
+                    let end = (start + chunk_size).min(nbuf.len());
+                    let chunk_nbuf = &nbuf[start..end];
+                    let mut iter = std::iter::from_fn(|| cons.pop());
+                    on_chunk(i, chunk_nbuf, &mut iter)?;
+                }
+
+                Ok::<(), E>(())
+            })?;
+        }
+    } else {
+        let mut iter = BsdiffIterator::new(obuf, nbuf, &index);
+        on_chunk(0, nbuf, &mut iter)?;
+    }
+
+    #[cfg(feature = "profiling")]
+    info!(
+        "scanning took {}",
+        DurationSpeed(obuf.len() as u64, before_scan.elapsed())
+    );
+
+    Ok(())
+}
+
+/// Produce a chunked patch: header + independent zstd-compressed sub-patches per scan chunk.
+#[cfg(feature = "enc")]
+pub fn simple_diff_chunked_with_params(
+    older: &[u8],
+    newer: &[u8],
+    out: &mut dyn Write,
+    diff_params: &DiffParams,
+    zstd_level: i32,
+) -> Result<(), io::Error> {
+    let chunk_size = diff_params.scan_chunk_size.unwrap_or(newer.len().max(1));
+    let num_chunks = if newer.is_empty() {
+        1
+    } else {
+        newer.len().div_ceil(chunk_size)
+    };
+
+    // Write header
+    out.write_all(&enc::MAGIC.to_le_bytes())?;
+    out.write_all(&enc::VERSION.to_le_bytes())?;
+    out.write_all(&(newer.len() as u64).to_le_bytes())?;
+    out.write_all(&(num_chunks as u32).to_le_bytes())?;
+
+    diff_chunked(older, newer, diff_params, |i, chunk_nbuf, matches| {
+        let new_start = i * chunk_size;
+        let new_len = chunk_nbuf.len();
+
+        // Collect sub-patch Controls into a buffer
+        let mut sub_patch = Vec::new();
+        let mut w = enc::Writer::new_raw(&mut sub_patch);
+        let mut first_old_start: u64 = 0;
+        let mut is_first = true;
+
+        let mut translator =
+            Translator::new(older, chunk_nbuf, |control| -> Result<(), io::Error> {
+                w.write(control)
+            });
+
+        #[allow(clippy::while_let_on_iterator)]
+        while let Some(m) = matches.next() {
+            if is_first {
+                first_old_start = m.add_old_start as u64;
+                is_first = false;
+            }
+            translator.translate(m)?;
+        }
+        translator.close()?;
+
+        // Compress sub-patch independently
+        let raw_len = sub_patch.len() as u64;
+        let compressed = zstd::bulk::compress(&sub_patch, zstd_level).map_err(io::Error::other)?;
+
+        // Write chunk metadata + compressed data
+        out.write_all(&first_old_start.to_le_bytes())?;
+        out.write_all(&(new_start as u64).to_le_bytes())?;
+        out.write_all(&(new_len as u64).to_le_bytes())?;
+        out.write_all(&raw_len.to_le_bytes())?;
+        out.write_all(&(compressed.len() as u64).to_le_bytes())?;
+        out.write_all(&compressed)?;
+
+        Ok::<(), io::Error>(())
+    })?;
 
     Ok(())
 }

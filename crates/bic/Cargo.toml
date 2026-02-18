@@ -20,5 +20,7 @@ mimalloc = "0.1"
 size = "0.5"
 ringbuf = "0.4"
 anyhow = "1"
+rayon = "1.11"
 
-zstd = "0.13"
+libc = "0.2"
+tempfile = "3"

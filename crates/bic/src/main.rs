@@ -1,17 +1,14 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod ring_pipe;
-
 use anyhow::{Context, Result};
 use bidiff::DiffParams;
 use clap::Parser;
 use memmap2::Mmap;
-use ring_pipe::ring_pipe;
 use size::Size;
 use std::{
     fs::File,
-    io::{self, BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     path::PathBuf,
     time::Instant,
 };
@@ -107,77 +104,52 @@ fn do_cycle(
         max,
     }: &Cycle,
 ) -> Result<()> {
-    info!("Memory-mapping older and newer...");
-    let (older, newer) = (mmap_file(older)?, mmap_file(newer)?);
-
+    let newer_mmap = mmap_file(newer)?;
     info!(
         "Before {}, After {}",
-        Size::from_bytes(older.len()),
-        Size::from_bytes(newer.len()),
+        Size::from_bytes(std::fs::metadata(older)?.len()),
+        Size::from_bytes(newer_mmap.len()),
     );
 
-    let mut compatch = Vec::new();
+    let patch_tmp = tempfile::NamedTempFile::new().context("create patch tempfile")?;
+    let output_tmp = tempfile::NamedTempFile::new().context("create output tempfile")?;
+    let patch_path = patch_tmp.path().to_path_buf();
+    let output_path = output_tmp.path().to_path_buf();
+
     let before_diff = Instant::now();
-
-    {
-        let mut compatch_w = io::Cursor::new(&mut compatch);
-
-        let (mut patch_r, mut patch_w) = ring_pipe(1024 * 1024);
-        let diff_params =
-            DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                bidiff::simple_diff_with_params(&older[..], &newer[..], &mut patch_w, &diff_params)
-                    .context("simple diff with params")
-                    .unwrap();
-                patch_w.flush().unwrap();
-                drop(patch_w);
-            });
-            let zstd_level = if *max { 22 } else { 3 };
-            zstd::stream::copy_encode(&mut patch_r, &mut compatch_w, zstd_level)
-                .context("compress")
-                .unwrap();
-        });
-    }
-
+    do_diff(&Diff {
+        older: older.clone(),
+        newer: newer.clone(),
+        patch: patch_path.clone(),
+        block_size: *block_size,
+        scan_chunk_size: *scan_chunk_size,
+        threads: *threads,
+        max: *max,
+    })?;
     let diff_duration = before_diff.elapsed();
 
-    let ratio = (compatch.len() as f64) / (newer.len() as f64);
+    let compatch_size = std::fs::metadata(&patch_path)?.len();
 
-    let mut fresh = Vec::with_capacity(newer.len());
     let before_patch = Instant::now();
-    {
-        let mut older = io::Cursor::new(&older[..]);
-
-        let (patch_r, patch_w) = ring_pipe(1024 * 1024);
-
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                zstd::stream::copy_decode(&compatch[..], patch_w)
-                    .context("decompress")
-                    .unwrap();
-            });
-
-            let mut r = bipatch::Reader::new(patch_r, &mut older)
-                .context("read patch")
-                .unwrap();
-            let fresh_size = io::copy(&mut r, &mut fresh).unwrap();
-
-            assert_eq!(fresh_size as usize, newer.len());
-        });
-    }
+    do_patch(&Patch {
+        older: older.clone(),
+        patch: patch_path,
+        output: output_path.clone(),
+    })?;
     let patch_duration = before_patch.elapsed();
 
-    let newer_hash = blake3::hash(&newer[..]);
+    let fresh = mmap_file(&output_path)?;
+    anyhow::ensure!(fresh.len() == newer_mmap.len(), "Size mismatch!");
+    let newer_hash = blake3::hash(&newer_mmap[..]);
     let fresh_hash = blake3::hash(&fresh[..]);
-
     anyhow::ensure!(newer_hash == fresh_hash, "Hash mismatch!");
 
-    let cp = format!("patch {}", Size::from_bytes(compatch.len()));
+    let ratio = (compatch_size as f64) / (newer_mmap.len() as f64);
+    let cp = format!("patch {}", Size::from_bytes(compatch_size as usize));
     let cr = format!(
         "{:03.3}% of {}",
         ratio * 100.0,
-        Size::from_bytes(newer.len())
+        Size::from_bytes(newer_mmap.len())
     );
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);
@@ -195,20 +167,60 @@ fn do_patch(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let compatch_r = BufReader::new(File::open(patch).context("open patch file")?);
-    let (patch_r, patch_w) = ring_pipe(1024 * 1024);
+    // Mmap patch file directly — each chunk is independently compressed inside
+    let patch_data = mmap_file(patch)?;
 
-    std::thread::spawn(move || {
-        zstd::stream::copy_decode(compatch_r, patch_w)
-            .context("decompress")
-            .unwrap();
+    // Parse chunked patch header (zero-copy: borrows slices from patch_data)
+    let header = bipatch::read_patch(&patch_data).context("read chunked patch header")?;
+    let older = mmap_file(older)?;
+
+    // Setup output mmap with fallocate + huge pages
+    let output_file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output)
+        .context("create output file")?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // fallocate pre-allocates disk blocks, avoiding per-page block allocation during writes.
+        // Falls back to ftruncate on failure (e.g. tmpfs).
+        if unsafe { libc::fallocate(output_file.as_raw_fd(), 0, 0, header.new_size as i64) } != 0 {
+            output_file
+                .set_len(header.new_size)
+                .context("pre-size output file")?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    output_file
+        .set_len(header.new_size)
+        .context("pre-size output file")?;
+    let mut output_mmap =
+        unsafe { memmap2::MmapMut::map_mut(&output_file) }.context("mmap output file")?;
+    #[cfg(unix)]
+    output_mmap.advise(memmap2::Advice::HugePage).ok();
+
+    // Apply chunks in parallel using rayon's thread pool for bounded parallelism.
+    let out = output_mmap.as_mut_ptr() as usize;
+    let out_len = output_mmap.len();
+    rayon::scope(|s| {
+        for chunk in &header.chunks {
+            let start = chunk.new_start as usize;
+            let len = chunk.new_len as usize;
+            assert!(start + len <= out_len);
+            // SAFETY: each chunk writes to a non-overlapping region of the mmap.
+            let output_slice =
+                unsafe { std::slice::from_raw_parts_mut((out + start) as *mut u8, len) };
+            let old_ref = &older[..];
+            s.spawn(move |_| {
+                bipatch::apply_chunk(chunk, old_ref, output_slice).unwrap();
+            });
+        }
     });
 
-    let older = mmap_file(older)?;
-    let mut older_cursor = io::Cursor::new(&older[..]);
-    let mut fresh_r = bipatch::Reader::new(patch_r, &mut older_cursor).context("read patch")?;
-    let mut output_w = BufWriter::new(File::create(output).context("create patch file")?);
-    io::copy(&mut fresh_r, &mut output_w).context("write output file")?;
+    output_mmap.flush_async().context("flush output mmap")?;
 
     info!("Completed in {:?}", start.elapsed());
 
@@ -240,33 +252,18 @@ fn do_diff(
     let older_contents = mmap_file(older)?;
     let newer_contents = mmap_file(newer)?;
 
-    let (mut patch_r, mut patch_w) = ring_pipe(1024 * 1024);
     let diff_params = DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            bidiff::simple_diff_with_params(
-                &older_contents[..],
-                &newer_contents[..],
-                &mut patch_w,
-                &diff_params,
-            )
-            .context("simple diff with params")
-            .unwrap();
-            patch_w.flush().unwrap();
-            drop(patch_w);
-        });
-
-        let mut compatch_w =
-            BufWriter::new(File::create(patch).context("create patch file").unwrap());
-        let zstd_level = if *max { 22 } else { 3 };
-        zstd::stream::copy_encode(&mut patch_r, &mut compatch_w, zstd_level)
-            .context("write output file")
-            .unwrap();
-        compatch_w
-            .flush()
-            .context("finish writing output file")
-            .unwrap();
-    });
+    let zstd_level = if *max { 22 } else { 3 };
+    let mut out = BufWriter::new(File::create(patch).context("create patch file")?);
+    bidiff::simple_diff_chunked_with_params(
+        &older_contents[..],
+        &newer_contents[..],
+        &mut out,
+        &diff_params,
+        zstd_level,
+    )
+    .context("chunked diff")?;
+    out.flush().context("finish writing patch file")?;
 
     info!("Completed in {:?}", start.elapsed());
 

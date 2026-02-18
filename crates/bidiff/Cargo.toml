@@ -9,7 +9,7 @@ repository = "https://github.com/divvun/bidiff"
 
 [features]
 default = ["enc"]
-enc = ["integer-encoding"]
+enc = ["integer-encoding", "zstd"]
 parallel = ["rayon", "ringbuf"]
 instructions = []
 profiling = []
@@ -17,6 +17,9 @@ profiling = []
 [dependencies]
 # for enc
 integer-encoding = { workspace = true, optional = true }
+
+# for enc
+zstd = { version = "0.13", optional = true }
 
 # other deps
 tracing.workspace = true

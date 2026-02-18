@@ -9,3 +9,4 @@ repository = "https://github.com/divvun/bidiff"
 
 [dependencies]
 integer-encoding.workspace = true
+zstd = "0.13"
