@@ -171,7 +171,7 @@ fn do_patch(
     let patch_data = mmap_file(patch)?;
 
     // Parse chunked patch header (zero-copy: borrows slices from patch_data)
-    let header = bipatch::read_patch(&patch_data).context("read chunked patch header")?;
+    let header = bidiff::patch::read_patch(&patch_data).context("read chunked patch header")?;
     let older = mmap_file(older)?;
 
     // Setup output mmap with fallocate + huge pages
@@ -215,7 +215,7 @@ fn do_patch(
                 unsafe { std::slice::from_raw_parts_mut((out + start) as *mut u8, len) };
             let old_ref = &older[..];
             s.spawn(move |_| {
-                bipatch::apply_chunk(chunk, old_ref, output_slice).unwrap();
+                bidiff::patch::apply_chunk(chunk, old_ref, output_slice).unwrap();
             });
         }
     });

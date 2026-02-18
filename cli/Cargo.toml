@@ -1,18 +1,21 @@
 [package]
-name = "bic"
+name = "bidiff-cli"
 version = "1.1.0"
-description = "A bsdiff-derived binary patching tool - example CLI tool"
+description = "A bsdiff-derived binary patching tool"
 license = "Apache-2.0 OR MIT"
 authors = ["Amos Wenger <amoswenger@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
-[dependencies]
-bidiff = { path = "../bidiff", features = ["enc"] }
-bipatch = { path = "../bipatch" }
+[[bin]]
+name = "bidiff"
+path = "src/main.rs"
 
-memmap2.workspace = true
-tracing.workspace = true
+[dependencies]
+bidiff = { path = ".." }
+
+memmap2 = "0.9"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"

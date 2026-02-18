@@ -1,12 +1,17 @@
+#[cfg(feature = "diff")]
 use rayon::prelude::*;
 #[cfg(feature = "enc")]
 use std::io::{self, Write};
 use std::{cmp::min, error::Error};
+#[cfg(feature = "diff")]
 use tracing::info;
 
+#[cfg(feature = "diff")]
 use hashindex::HashIndex;
 
+#[cfg(feature = "diff")]
 mod ring_channel;
+#[cfg(feature = "diff")]
 use ring_channel::{RingProducer, ring_channel};
 
 #[cfg(feature = "profiling")]
@@ -23,7 +28,11 @@ fn count_matching_bytes(a: &[u8], b: &[u8]) -> usize {
 #[cfg(feature = "enc")]
 pub mod enc;
 
+#[cfg(feature = "diff")]
 pub mod hashindex;
+
+#[cfg(feature = "patch")]
+pub mod patch;
 
 #[cfg(any(test, feature = "instructions"))]
 pub mod instructions;
@@ -135,6 +144,7 @@ where
     }
 }
 
+#[cfg(feature = "diff")]
 struct BsdiffIterator<'a> {
     scan: usize,
     pos: usize,
@@ -150,6 +160,7 @@ struct BsdiffIterator<'a> {
     sa: &'a HashIndex<'a>,
 }
 
+#[cfg(feature = "diff")]
 impl<'a> BsdiffIterator<'a> {
     pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a HashIndex<'a>) -> Self {
         Self {
@@ -167,6 +178,7 @@ impl<'a> BsdiffIterator<'a> {
     }
 }
 
+#[cfg(feature = "diff")]
 impl<'a> Iterator for BsdiffIterator<'a> {
     type Item = Match;
     fn next(&mut self) -> Option<Self::Item> {
@@ -371,7 +383,6 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 pub struct DiffParams {
     /// Block size for hash index (default 32). Must be >= 4.
     pub block_size: usize,
-    /// Only used when the `parallel` feature is enabled.
     pub(crate) scan_chunk_size: Option<usize>,
     /// Max threads for parallel scanning. `None` = use all available cores.
     pub(crate) num_threads: Option<usize>,
@@ -421,7 +432,7 @@ impl DiffParams {
 impl Default for DiffParams {
     fn default() -> Self {
         Self {
-            block_size: hashindex::DEFAULT_BLOCK_SIZE,
+            block_size: 32,
             scan_chunk_size: None,
             num_threads: None,
         }
@@ -429,6 +440,7 @@ impl Default for DiffParams {
 }
 
 /// Diff two files
+#[cfg(feature = "diff")]
 pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], params: &DiffParams, mut on_match: F) -> Result<(), E>
 where
     F: FnMut(Match) -> Result<(), E>,
@@ -556,12 +568,12 @@ mod profiling {
 #[cfg(feature = "profiling")]
 use profiling::DurationSpeed;
 
-#[cfg(feature = "enc")]
+#[cfg(all(feature = "diff", feature = "enc"))]
 pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
     simple_diff_with_params(older, newer, out, &Default::default())
 }
 
-#[cfg(feature = "enc")]
+#[cfg(all(feature = "diff", feature = "enc"))]
 pub fn simple_diff_with_params(
     older: &[u8],
     newer: &[u8],
@@ -573,6 +585,7 @@ pub fn simple_diff_with_params(
 
 /// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches, hash_index)` per chunk
 /// with chunk-relative match positions (add_new_start/copy_end NOT offset-adjusted).
+#[cfg(feature = "diff")]
 pub fn diff_chunked<F, E>(
     obuf: &[u8],
     nbuf: &[u8],
@@ -663,7 +676,7 @@ where
 }
 
 /// Produce a chunked patch: header + independent zstd-compressed sub-patches per scan chunk.
-#[cfg(feature = "enc")]
+#[cfg(all(feature = "diff", feature = "enc"))]
 pub fn simple_diff_chunked_with_params(
     older: &[u8],
     newer: &[u8],
@@ -733,10 +746,12 @@ pub fn simple_diff_chunked_with_params(
     Ok(())
 }
 
+#[cfg(feature = "diff")]
 pub fn assert_cycle(older: &[u8], newer: &[u8]) {
     assert_cycle_with_params(older, newer, &Default::default());
 }
 
+#[cfg(feature = "diff")]
 pub fn assert_cycle_with_params(older: &[u8], newer: &[u8], params: &DiffParams) {
     let mut older_pos = 0_usize;
     let mut newer_pos = 0_usize;

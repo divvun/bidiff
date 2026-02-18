@@ -1,18 +1,35 @@
+[package]
+name = "bidiff"
+version = "1.1.0"
+description = "A bsdiff-derived binary diff and patch library"
+license = "Apache-2.0 OR MIT"
+authors = ["Amos Wenger <amoswenger@gmail.com>"]
+edition = "2024"
+repository = "https://github.com/divvun/bidiff"
+
+[features]
+default = ["diff", "enc", "patch"]
+diff = ["rayon", "ringbuf", "memmap2", "tempfile"]
+enc = ["integer-encoding", "zstd"]
+patch = ["integer-encoding", "zstd"]
+instructions = []
+profiling = []
+
+[dependencies]
+tracing = "0.1"
+integer-encoding = { version = "4", default-features = false, optional = true }
+zstd = { version = "0.13", optional = true }
+rayon = { version = "1.11", optional = true }
+ringbuf = { version = "0.4", optional = true }
+memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+proptest = "1"
 
 [workspace]
-resolver = "3"
-members = [
-    "crates/bidiff",
-    "crates/bipatch",
-    "crates/bic"
-]
-
-[workspace.dependencies]
-integer-encoding = { version = "4", default-features = false }
-tracing = "0.1"
-memmap2 = "0.9"
+members = ["cli"]
 
 [profile.release]
 debug = true
 lto = "fat"
-
