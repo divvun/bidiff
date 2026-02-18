@@ -1,14 +1,10 @@
+use super::{MAGIC, VERSION};
 use integer_encoding::VarInt;
-use integer_encoding::VarIntReader;
 use std::{
-    cmp::min,
     error::Error as StdError,
     fmt,
-    io::{self, ErrorKind, Read, Seek, SeekFrom},
+    io::{self, ErrorKind},
 };
-
-pub const MAGIC: u32 = 0xB1DF;
-pub const VERSION: u32 = 0x2000;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -45,18 +41,6 @@ impl From<io::Error> for DecodeError {
     fn from(source: io::Error) -> Self {
         DecodeError::IO(source)
     }
-}
-
-fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    r.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
 }
 
 // --- Chunked patch format (zero-copy) ---
@@ -220,134 +204,4 @@ pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], output: &mut [u8]) -> io::R
 
     debug_assert_eq!(out_pos, chunk.new_len as usize);
     Ok(())
-}
-
-// --- Streaming reader (legacy) ---
-
-pub struct Reader<R, RS>
-where
-    R: Read,
-    RS: Read + Seek,
-{
-    patch: R,
-    old: RS,
-    new_size: u64,
-    state: ReaderState,
-    buf: Vec<u8>,
-}
-
-#[derive(Debug)]
-enum ReaderState {
-    Initial,
-    Add(usize),
-    Copy(usize),
-    Final,
-}
-
-impl<R, RS> Reader<R, RS>
-where
-    R: Read,
-    RS: Read + Seek,
-{
-    pub fn new(mut patch: R, old: RS) -> Result<Self, DecodeError> {
-        let magic = read_u32_le(&mut patch)?;
-        if magic != MAGIC {
-            return Err(DecodeError::WrongMagic(magic));
-        }
-
-        let version = read_u32_le(&mut patch)?;
-        if version != VERSION {
-            return Err(DecodeError::WrongVersion(version));
-        }
-
-        let new_size = read_u64_le(&mut patch)?;
-
-        Ok(Self {
-            patch,
-            old,
-            new_size,
-            state: ReaderState::Initial,
-            buf: vec![0u8; 4096],
-        })
-    }
-
-    /// Returns the size of the new (patched) file, as stored in the patch header.
-    pub fn new_size(&self) -> u64 {
-        self.new_size
-    }
-}
-
-impl<R, RS> Read for Reader<R, RS>
-where
-    R: Read,
-    RS: Read + Seek,
-{
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        let mut read: usize = 0;
-
-        while !buf.is_empty() {
-            let processed = match self.state {
-                ReaderState::Initial => match self.patch.read_varint() {
-                    Ok(add_len) => {
-                        self.state = ReaderState::Add(add_len);
-                        0
-                    }
-                    Err(e) => match e.kind() {
-                        ErrorKind::UnexpectedEof => {
-                            self.state = ReaderState::Final;
-                            0
-                        }
-                        _ => {
-                            return Err(e);
-                        }
-                    },
-                },
-                ReaderState::Add(add_len) => {
-                    let n = min(min(add_len, buf.len()), self.buf.len());
-
-                    let out = &mut buf[..n];
-                    self.old.read_exact(out)?;
-
-                    let dif = &mut self.buf[..n];
-                    self.patch.read_exact(dif)?;
-
-                    for i in 0..n {
-                        out[i] = out[i].wrapping_add(dif[i]);
-                    }
-
-                    if add_len == n {
-                        let copy_len: usize = self.patch.read_varint()?;
-                        self.state = ReaderState::Copy(copy_len)
-                    } else {
-                        self.state = ReaderState::Add(add_len - n);
-                    }
-
-                    n
-                }
-                ReaderState::Copy(copy_len) => {
-                    let n = min(copy_len, buf.len());
-
-                    let out = &mut buf[..n];
-                    self.patch.read_exact(out)?;
-
-                    if copy_len == n {
-                        let seek: i64 = self.patch.read_varint()?;
-                        self.old.seek(SeekFrom::Current(seek))?;
-                        self.state = ReaderState::Initial;
-                    } else {
-                        self.state = ReaderState::Copy(copy_len - n);
-                    }
-
-                    n
-                }
-                ReaderState::Final => {
-                    break;
-                }
-            };
-            read += processed;
-            buf = &mut buf[processed..];
-        }
-
-        Ok(read)
-    }
 }

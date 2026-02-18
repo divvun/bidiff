@@ -1,7 +1,7 @@
 /// Generate a "newer" input from an "older" input and a set of instructions
 pub fn apply_instructions(older: &[u8], instructions: &[u8]) -> Vec<u8> {
     use std::cmp::min;
-    let mut newer: Vec<_> = older.iter().map(|x| *x).collect();
+    let mut newer = older.to_vec();
 
     for couple in instructions.chunks(2) {
         if couple.len() != 2 {
@@ -12,10 +12,7 @@ pub fn apply_instructions(older: &[u8], instructions: &[u8]) -> Vec<u8> {
         if i < 128 {
             let pos = (i as usize) % newer.len();
             let len = j as usize;
-            let data: Vec<u8> = (&newer[pos..min(pos + len, newer.len())])
-                .iter()
-                .map(|x| *x)
-                .collect();
+            let data = newer[pos..min(pos + len, newer.len())].to_vec();
             for c in data {
                 newer.push(c);
             }

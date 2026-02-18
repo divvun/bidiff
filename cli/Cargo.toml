@@ -20,8 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 mimalloc = "0.1"
-size = "0.5"
-ringbuf = "0.4"
 anyhow = "1"
 rayon = "1.11"
 

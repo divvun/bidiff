@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use bidiff::DiffParams;
 use clap::Parser;
 use memmap2::Mmap;
-use size::Size;
 use std::{
     fs::File,
     io::{BufWriter, Write},
@@ -75,6 +74,16 @@ struct Cycle {
     max: bool,
 }
 
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -107,8 +116,8 @@ fn do_cycle(
     let newer_mmap = mmap_file(newer)?;
     info!(
         "Before {}, After {}",
-        Size::from_bytes(std::fs::metadata(older)?.len()),
-        Size::from_bytes(newer_mmap.len()),
+        format_size(std::fs::metadata(older)?.len()),
+        format_size(newer_mmap.len() as u64),
     );
 
     let patch_tmp = tempfile::NamedTempFile::new().context("create patch tempfile")?;
@@ -145,11 +154,11 @@ fn do_cycle(
     anyhow::ensure!(newer_hash == fresh_hash, "Hash mismatch!");
 
     let ratio = (compatch_size as f64) / (newer_mmap.len() as f64);
-    let cp = format!("patch {}", Size::from_bytes(compatch_size as usize));
+    let cp = format!("patch {}", format_size(compatch_size));
     let cr = format!(
         "{:03.3}% of {}",
         ratio * 100.0,
-        Size::from_bytes(newer_mmap.len())
+        format_size(newer_mmap.len() as u64)
     );
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);

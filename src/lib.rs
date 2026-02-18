@@ -1,3 +1,6 @@
+pub const MAGIC: u32 = 0xB1DF;
+pub const VERSION: u32 = 0x2000;
+
 #[cfg(feature = "diff")]
 use rayon::prelude::*;
 #[cfg(feature = "enc")]
@@ -568,21 +571,6 @@ mod profiling {
 #[cfg(feature = "profiling")]
 use profiling::DurationSpeed;
 
-#[cfg(all(feature = "diff", feature = "enc"))]
-pub fn simple_diff(older: &[u8], newer: &[u8], out: &mut dyn Write) -> Result<(), io::Error> {
-    simple_diff_with_params(older, newer, out, &Default::default())
-}
-
-#[cfg(all(feature = "diff", feature = "enc"))]
-pub fn simple_diff_with_params(
-    older: &[u8],
-    newer: &[u8],
-    out: &mut dyn Write,
-    diff_params: &DiffParams,
-) -> Result<(), io::Error> {
-    simple_diff_chunked_with_params(older, newer, out, diff_params, 3)
-}
-
 /// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches, hash_index)` per chunk
 /// with chunk-relative match positions (add_new_start/copy_end NOT offset-adjusted).
 #[cfg(feature = "diff")]
@@ -692,8 +680,8 @@ pub fn simple_diff_chunked_with_params(
     };
 
     // Write header
-    out.write_all(&enc::MAGIC.to_le_bytes())?;
-    out.write_all(&enc::VERSION.to_le_bytes())?;
+    out.write_all(&MAGIC.to_le_bytes())?;
+    out.write_all(&VERSION.to_le_bytes())?;
     out.write_all(&(newer.len() as u64).to_le_bytes())?;
     out.write_all(&(num_chunks as u32).to_le_bytes())?;
 
@@ -707,7 +695,7 @@ pub fn simple_diff_chunked_with_params(
 
             // Collect sub-patch Controls into a buffer
             let mut sub_patch = Vec::new();
-            let mut w = enc::Writer::new_raw(&mut sub_patch);
+            let mut w = enc::Writer::new(&mut sub_patch);
             let mut first_old_start: u64 = 0;
             let mut is_first = true;
 

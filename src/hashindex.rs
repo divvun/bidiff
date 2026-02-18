@@ -1,20 +1,16 @@
 use std::cmp::min;
 use std::fmt;
 
-/// Default block size for hashing (32 bytes)
-pub const DEFAULT_BLOCK_SIZE: usize = 32;
-
 // ---------------------------------------------------------------------------
 // Inlined from sacabase: common_prefix_len, LongestCommonSubstring
 // ---------------------------------------------------------------------------
 
-pub struct LongestCommonSubstring<'a> {
-    pub text: &'a [u8],
+pub struct LongestCommonSubstring {
     pub start: usize,
     pub len: usize,
 }
 
-impl<'a> fmt::Debug for LongestCommonSubstring<'a> {
+impl fmt::Debug for LongestCommonSubstring {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "T[{}..{}]", self.start, self.start + self.len)
     }
@@ -109,17 +105,6 @@ mod mmap_table {
             // SAFETY: i < self.len (debug_assert above), mmap is len*8 bytes,
             // so pointer offset is within the allocation. Aligned u64 read.
             unsafe { (self.mmap.as_ptr() as *const u64).add(i).read() }
-        }
-
-        #[inline(always)]
-        #[allow(dead_code)]
-        pub fn set(&self, i: usize, v: u64) {
-            debug_assert!(i < self.len);
-            // SAFETY: i < self.len (debug_assert above). Only called from the
-            // serial construction path (single-threaded, no concurrent access).
-            unsafe {
-                (self.mmap.as_ptr() as *mut u64).add(i).write(v);
-            }
         }
 
         /// Compare-and-swap for lock-free parallel insertion.
@@ -419,19 +404,10 @@ impl<'a> HashIndex<'a> {
         }
     }
 
-    #[inline(always)]
-    pub fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    pub fn longest_substring_match(&self, needle: &[u8]) -> LongestCommonSubstring<'a> {
+    pub fn longest_substring_match(&self, needle: &[u8]) -> LongestCommonSubstring {
         // If needle is shorter than block_size, we can't hash it
         if needle.len() < self.block_size || self.text.len() < self.block_size {
-            return LongestCommonSubstring {
-                text: self.text,
-                start: 0,
-                len: 0,
-            };
+            return LongestCommonSubstring { start: 0, len: 0 };
         }
 
         // Hash the first block_size bytes of the needle and look up
@@ -445,16 +421,11 @@ impl<'a> HashIndex<'a> {
                     &needle[self.block_size..],
                 );
             LongestCommonSubstring {
-                text: self.text,
                 start: text_offset,
                 len: match_len,
             }
         } else {
-            LongestCommonSubstring {
-                text: self.text,
-                start: 0,
-                len: 0,
-            }
+            LongestCommonSubstring { start: 0, len: 0 }
         }
     }
 
@@ -463,13 +434,9 @@ impl<'a> HashIndex<'a> {
         &self,
         needle: &[u8],
         h: u64,
-    ) -> LongestCommonSubstring<'a> {
+    ) -> LongestCommonSubstring {
         if needle.len() < self.block_size || self.text.len() < self.block_size {
-            return LongestCommonSubstring {
-                text: self.text,
-                start: 0,
-                len: 0,
-            };
+            return LongestCommonSubstring { start: 0, len: 0 };
         }
 
         let block = &needle[..self.block_size];
@@ -481,16 +448,11 @@ impl<'a> HashIndex<'a> {
                     &needle[self.block_size..],
                 );
             LongestCommonSubstring {
-                text: self.text,
                 start: text_offset,
                 len: match_len,
             }
         } else {
-            LongestCommonSubstring {
-                text: self.text,
-                start: 0,
-                len: 0,
-            }
+            LongestCommonSubstring { start: 0, len: 0 }
         }
     }
 }
