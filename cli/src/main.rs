@@ -30,7 +30,7 @@ enum Command {
     Cycle(Cycle),
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Diff {
     older: PathBuf,
     newer: PathBuf,
@@ -38,15 +38,18 @@ struct Diff {
     /// Hash index block size (minimum 4)
     #[arg(long, default_value_t = 32)]
     block_size: usize,
-    /// Optionally specify a chunk size
-    #[arg(long)]
-    scan_chunk_size: Option<usize>,
+    /// Scan chunk size in MB (default: 1)
+    #[arg(long, default_value_t = 1)]
+    scan_chunk_mb: usize,
     /// Max threads for parallel scanning (default: all cores)
     #[arg(long)]
     threads: Option<usize>,
     /// Maximize compression (zstd level 22); slower but ~30% smaller patches
     #[arg(long)]
     max: bool,
+    /// Keep hash table in RAM (faster but uses ~500 MB+ for large files)
+    #[arg(long)]
+    ram: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -63,15 +66,38 @@ struct Cycle {
     /// Hash index block size (minimum 4)
     #[arg(long, default_value_t = 32)]
     block_size: usize,
-    /// Optionally specify a chunk size
-    #[arg(long)]
-    scan_chunk_size: Option<usize>,
+    /// Scan chunk size in MB (default: 1)
+    #[arg(long, default_value_t = 1)]
+    scan_chunk_mb: usize,
     /// Max threads for parallel scanning (default: all cores)
     #[arg(long)]
     threads: Option<usize>,
     /// Maximize compression (zstd level 22); slower but ~30% smaller patches
     #[arg(long)]
     max: bool,
+    /// Keep hash table in RAM (faster but uses ~500 MB+ for large files)
+    #[arg(long)]
+    ram: bool,
+    /// Also measure peak anonymous RSS (runs a separate diff pass with a polling thread)
+    #[arg(long)]
+    with_anon: bool,
+}
+
+/// Read anonymous RSS (heap + anonymous mmap) from /proc/self/status.
+/// Excludes file-backed mmap pages — only counts "real" memory allocations.
+fn read_rss_anon() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("RssAnon:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
 }
 
 fn format_size(bytes: u64) -> String {
@@ -108,9 +134,11 @@ fn do_cycle(
         older,
         newer,
         block_size,
-        scan_chunk_size,
+        scan_chunk_mb,
         threads,
         max,
+        ram,
+        with_anon,
     }: &Cycle,
 ) -> Result<()> {
     let newer_mmap = mmap_file(newer)?;
@@ -120,6 +148,42 @@ fn do_cycle(
         format_size(newer_mmap.len() as u64),
     );
 
+    let diff_args = Diff {
+        older: older.clone(),
+        newer: newer.clone(),
+        patch: PathBuf::new(), // filled in below
+        block_size: *block_size,
+        scan_chunk_mb: *scan_chunk_mb,
+        threads: *threads,
+        max: *max,
+        ram: *ram,
+    };
+
+    // Separate anon RSS measurement pass (if requested) — uses a polling thread
+    // so we don't contaminate the timing run.
+    let peak_mem = if *with_anon {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let peak_anon = std::sync::Arc::new(AtomicU64::new(0));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let peak_clone = peak_anon.clone();
+        let done_clone = done.clone();
+        std::thread::spawn(move || {
+            while !done_clone.load(Ordering::Relaxed) {
+                peak_clone.fetch_max(read_rss_anon(), Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let anon_tmp = tempfile::NamedTempFile::new().context("create anon tempfile")?;
+        do_diff(&Diff {
+            patch: anon_tmp.path().to_path_buf(),
+            ..diff_args.clone()
+        })?;
+        done.store(true, Ordering::Release);
+        Some(peak_anon.load(Ordering::Acquire))
+    } else {
+        None
+    };
+
     let patch_tmp = tempfile::NamedTempFile::new().context("create patch tempfile")?;
     let output_tmp = tempfile::NamedTempFile::new().context("create output tempfile")?;
     let patch_path = patch_tmp.path().to_path_buf();
@@ -127,13 +191,8 @@ fn do_cycle(
 
     let before_diff = Instant::now();
     do_diff(&Diff {
-        older: older.clone(),
-        newer: newer.clone(),
         patch: patch_path.clone(),
-        block_size: *block_size,
-        scan_chunk_size: *scan_chunk_size,
-        threads: *threads,
-        max: *max,
+        ..diff_args
     })?;
     let diff_duration = before_diff.elapsed();
 
@@ -162,7 +221,15 @@ fn do_cycle(
     );
     let cdd = format!("dtime {:?}", diff_duration);
     let cpd = format!("ptime {:?}", patch_duration);
-    println!("{:12} {:20} {:27} {:20} {:20}", "zstd", cp, cr, cdd, cpd);
+    if let Some(mem) = peak_mem {
+        let cmem = format!("anon {}", format_size(mem));
+        println!(
+            "{:12} {:20} {:27} {:20} {:20} {:20}",
+            "zstd", cp, cr, cdd, cpd, cmem
+        );
+    } else {
+        println!("{:12} {:20} {:27} {:20} {:20}", "zstd", cp, cr, cdd, cpd);
+    }
 
     Ok(())
 }
@@ -251,9 +318,10 @@ fn do_diff(
         newer,
         patch,
         block_size,
-        scan_chunk_size,
+        scan_chunk_mb,
         threads,
         max,
+        ram,
     }: &Diff,
 ) -> Result<()> {
     let start = Instant::now();
@@ -265,7 +333,9 @@ fn do_diff(
     #[cfg(unix)]
     newer_contents.advise(memmap2::Advice::Sequential).ok();
 
-    let diff_params = DiffParams::with_threads(*block_size, *scan_chunk_size, *threads).unwrap();
+    let scan_chunk_size = Some(scan_chunk_mb * 1024 * 1024);
+    let mut diff_params = DiffParams::with_threads(*block_size, scan_chunk_size, *threads).unwrap();
+    diff_params.use_ram = *ram;
     let zstd_level = if *max { 22 } else { 3 };
     let mut out = BufWriter::new(File::create(patch).context("create patch file")?);
     bidiff::simple_diff_chunked_with_params(

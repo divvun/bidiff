@@ -73,17 +73,25 @@ mod mmap_table {
     unsafe impl Sync for MmapTable {}
 
     impl MmapTable {
-        /// Create a new table of `len` u64 slots, all initialized to EMPTY (u64::MAX).
-        pub fn new(len: usize) -> io::Result<Self> {
+        /// Create a new table of `len` u64 slots, all initialized to zero (EMPTY).
+        ///
+        /// If `use_ram` is true, uses an anonymous mmap (pinned in RAM, faster).
+        /// If false, uses a file-backed mmap (kernel can page to disk under memory pressure).
+        pub fn new(len: usize, use_ram: bool) -> io::Result<Self> {
             let byte_len = len * std::mem::size_of::<u64>();
-            // Use current directory (real FS) instead of /tmp (often tmpfs).
-            // On tmpfs, pages can't be paged to disk under memory pressure.
-            let file = tempfile::tempfile_in(".")?;
-            file.set_len(byte_len as u64)?;
-            // SAFETY: Private tempfile — no other process can modify the mapping.
-            // The file handle is dropped after mmap creation; the mapping persists.
-            let mmap = unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? };
-            // File handle dropped here — mapping persists, kernel can page to disk.
+
+            let mmap = if use_ram {
+                // SAFETY: Anonymous mmap — no file backing, no external references.
+                MmapMut::map_anon(byte_len)?
+            } else {
+                // Use current directory (real FS) instead of /tmp (often tmpfs).
+                // On tmpfs, pages can't be paged to disk under memory pressure.
+                let file = tempfile::tempfile_in(".")?;
+                file.set_len(byte_len as u64)?;
+                // SAFETY: Private tempfile — no other process can modify the mapping.
+                // The file handle is dropped after mmap creation; the mapping persists.
+                unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? }
+            };
 
             // EMPTY = 0, so kernel-zeroed pages are already initialized.
             // No memset needed — saves ~100ms for large tables.
@@ -234,8 +242,8 @@ impl<'a> HashIndex<'a> {
     ///
     /// The block size controls the granularity of matching. Smaller blocks find
     /// more matches but use more memory. 32 bytes is a good default.
-    pub fn new(text: &'a [u8], block_size: usize) -> Self {
-        let index = Self::new_empty(text, block_size);
+    pub fn new(text: &'a [u8], block_size: usize, use_ram: bool) -> Self {
+        let index = Self::new_empty(text, block_size, use_ram);
         index.populate();
         index
     }
@@ -243,14 +251,14 @@ impl<'a> HashIndex<'a> {
     /// Allocate an empty hash index (table created but no entries inserted).
     /// Call `populate()` to insert entries. Lookups on an unpopulated index
     /// return no matches.
-    pub fn new_empty(text: &'a [u8], block_size: usize) -> Self {
+    pub fn new_empty(text: &'a [u8], block_size: usize, use_ram: bool) -> Self {
         assert!(block_size >= 4, "block_size must be at least 4");
 
         if text.len() < block_size {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(BUCKET_SIZE).expect("failed to allocate hash table"),
+                table: MmapTable::new(BUCKET_SIZE, use_ram).expect("failed to allocate hash table"),
                 mask: 0, // 1 bucket
             };
         }
@@ -260,7 +268,7 @@ impl<'a> HashIndex<'a> {
             return Self {
                 text,
                 block_size,
-                table: MmapTable::new(BUCKET_SIZE).expect("failed to allocate hash table"),
+                table: MmapTable::new(BUCKET_SIZE, use_ram).expect("failed to allocate hash table"),
                 mask: 0, // 1 bucket
             };
         }
@@ -273,7 +281,7 @@ impl<'a> HashIndex<'a> {
             .max(1);
         let table_size = num_buckets * BUCKET_SIZE;
         let mask = num_buckets - 1;
-        let table = MmapTable::new(table_size).expect("failed to allocate hash table");
+        let table = MmapTable::new(table_size, use_ram).expect("failed to allocate hash table");
 
         Self {
             text,
@@ -464,7 +472,7 @@ mod tests {
     #[test]
     fn basic_match() {
         let text = b"hello world, hello rust!";
-        let idx = HashIndex::new(text, 4);
+        let idx = HashIndex::new(text, 4, true);
         // "hell" appears at offset 0 and 13. The hash table stores only one
         // entry per unique block, so we get whichever one was stored. The match
         // extends forward from that point. Either way we get a valid match.
@@ -480,7 +488,7 @@ mod tests {
     #[test]
     fn no_match() {
         let text = b"abcdefghijklmnop";
-        let idx = HashIndex::new(text, 4);
+        let idx = HashIndex::new(text, 4, true);
         let result = idx.longest_substring_match(b"xyzw1234");
         assert_eq!(result.len, 0);
     }
@@ -488,7 +496,7 @@ mod tests {
     #[test]
     fn empty_text() {
         let text = b"";
-        let idx = HashIndex::new(text, 4);
+        let idx = HashIndex::new(text, 4, true);
         let result = idx.longest_substring_match(b"hello");
         assert_eq!(result.len, 0);
     }
@@ -496,7 +504,7 @@ mod tests {
     #[test]
     fn short_needle() {
         let text = b"abcdefghijklmnop";
-        let idx = HashIndex::new(text, 4);
+        let idx = HashIndex::new(text, 4, true);
         // Needle shorter than block_size — can't hash
         let result = idx.longest_substring_match(b"ab");
         assert_eq!(result.len, 0);
@@ -507,7 +515,7 @@ mod tests {
         // "the " starts at offset 0 (aligned to block_size=4),
         // so "the lazy" should find a match starting there or at offset 31.
         let text = b"the quick brown fox jumps over the lazy dog!";
-        let idx = HashIndex::new(text, 4);
+        let idx = HashIndex::new(text, 4, true);
         let result = idx.longest_substring_match(b"the lazy dog!");
         // "the " at offset 32 is block-aligned (32/4=8), should match
         assert!(result.len >= 4, "expected match >= 4, got {}", result.len);

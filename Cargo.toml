@@ -1,16 +1,15 @@
 [package]
 name = "bidiff"
-version = "1.1.0"
-description = "A bsdiff-derived binary diff and patch library"
+version = "2.0.0-dev"
+description = "A (distantly) bsdiff-derived binary diff and patch library"
 license = "Apache-2.0 OR MIT"
-authors = ["Amos Wenger <amoswenger@gmail.com>"]
+authors = ["Brendan Molloy <brendan@bbqsrc.net>", "Amos Wenger <amoswenger@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
 [features]
-default = ["diff", "enc", "patch"]
+default = ["diff", "patch"]
 diff = ["rayon", "ringbuf", "memmap2", "tempfile"]
-enc = ["integer-encoding", "zstd"]
 patch = ["integer-encoding", "zstd"]
 instructions = []
 profiling = []
@@ -33,3 +32,6 @@ members = ["cli"]
 [profile.release]
 debug = true
 lto = "fat"
+codegen-units = 1
+panic = "abort"
+split-debuginfo = "packed"

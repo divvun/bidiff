@@ -1,9 +1,9 @@
 [package]
 name = "bidiff-cli"
-version = "1.1.0"
-description = "A bsdiff-derived binary patching tool"
+version = "2.0.0-dev"
+description = "A (distantly) bsdiff-derived binary patching tool"
 license = "Apache-2.0 OR MIT"
-authors = ["Amos Wenger <amoswenger@gmail.com>"]
+authors = ["Brendan Molloy <brendan@bbqsrc.net>", "Amos Wenger <amoswenger@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 

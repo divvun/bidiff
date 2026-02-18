@@ -3,7 +3,7 @@ pub const VERSION: u32 = 0x2000;
 
 #[cfg(feature = "diff")]
 use rayon::prelude::*;
-#[cfg(feature = "enc")]
+#[cfg(feature = "patch")]
 use std::io::{self, Write};
 use std::{cmp::min, error::Error};
 #[cfg(feature = "diff")]
@@ -28,7 +28,7 @@ fn count_matching_bytes(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
 }
 
-#[cfg(feature = "enc")]
+#[cfg(feature = "patch")]
 pub mod enc;
 
 #[cfg(feature = "diff")]
@@ -389,6 +389,9 @@ pub struct DiffParams {
     pub(crate) scan_chunk_size: Option<usize>,
     /// Max threads for parallel scanning. `None` = use all available cores.
     pub(crate) num_threads: Option<usize>,
+    /// Use anonymous mmap (RAM) instead of file-backed mmap for the hash table.
+    /// Faster but pins memory that can't be paged to disk.
+    pub use_ram: bool,
 }
 
 impl DiffParams {
@@ -428,6 +431,7 @@ impl DiffParams {
             block_size,
             scan_chunk_size,
             num_threads,
+            use_ram: false,
         })
     }
 }
@@ -438,6 +442,7 @@ impl Default for DiffParams {
             block_size: 32,
             scan_chunk_size: None,
             num_threads: None,
+            use_ram: false,
         }
     }
 }
@@ -451,7 +456,7 @@ where
     #[cfg(feature = "profiling")]
     let before_index = Instant::now();
 
-    let index = HashIndex::new(obuf, params.block_size);
+    let index = HashIndex::new(obuf, params.block_size, params.use_ram);
 
     #[cfg(feature = "profiling")]
     info!(
@@ -586,7 +591,7 @@ where
     #[cfg(feature = "profiling")]
     let before_index = Instant::now();
 
-    let index = HashIndex::new(obuf, params.block_size);
+    let index = HashIndex::new(obuf, params.block_size, params.use_ram);
 
     #[cfg(feature = "profiling")]
     info!(
@@ -664,7 +669,7 @@ where
 }
 
 /// Produce a chunked patch: header + independent zstd-compressed sub-patches per scan chunk.
-#[cfg(all(feature = "diff", feature = "enc"))]
+#[cfg(all(feature = "diff", feature = "patch"))]
 pub fn simple_diff_chunked_with_params(
     older: &[u8],
     newer: &[u8],
