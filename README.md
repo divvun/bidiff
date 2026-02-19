@@ -57,38 +57,38 @@ Smaller patches at the cost of much slower diff times. Patch application speed i
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 0.11s | 1m 2s | 62.5 MiB | 58.5s | 189 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 0.09s | 1m 18s | 57.6 MiB | 1m 21s | 186 MiB |
 
-### Comparison with bsdiff and xdelta3
+### Comparison with bidiff 1.1, bsdiff, and xdelta3
 
-All three tools with default settings. bsdiff 4.3, xdelta3 3.0.11 — both single-threaded. Same test system.
+bidiff 1.1 (suffix arrays, single-threaded scan), bsdiff 4.3, xdelta3 3.0.11. Same test system.
 
 #### Patch size
 
-| Test case | New size | bidiff | bsdiff | xdelta3 |
-|-----------|----------|--------|--------|---------|
-| Wine 4.18 &rarr; 4.19 | 201 MiB | 249 KiB (0.12%) | **110 KiB (0.05%)** | 256 KiB (0.12%) |
-| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.8 MiB (0.76%) | **5.0 MiB (0.56%)** | 5.4 MiB (0.60%) |
-| Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB (5.49%) | **7.8 MiB (3.95%)** | 21.7 MiB (10.95%) |
-| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB (5.71%) | **5.0 MiB (3.46%)** | 18.7 MiB (12.87%) |
+| Test case | New size | bidiff 2.0 | bidiff 1.1 | bsdiff | xdelta3 |
+|-----------|----------|------------|------------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | 201 MiB | 249 KiB (0.12%) | 180 KiB (0.09%) | **110 KiB (0.05%)** | 256 KiB (0.12%) |
+| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.8 MiB (0.76%) | 6.2 MiB (0.69%) | **5.0 MiB (0.56%)** | 5.4 MiB (0.60%) |
+| Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB (5.49%) | **7.2 MiB (3.66%)** | 7.8 MiB (3.95%) | 21.7 MiB (10.95%) |
+| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB (5.71%) | **5.2 MiB (3.59%)** | 5.0 MiB (3.46%) | 18.7 MiB (12.87%) |
 
 #### Diff time
 
-| Test case | bidiff | bsdiff | xdelta3 |
-|-----------|--------|--------|---------|
-| Wine 4.18 &rarr; 4.19 | **0.42s** | 3m 8s | 1.0s |
-| Linux 5.3 &rarr; 5.4 | **2.1s** | 15m 6s | 8.5s |
-| Firefox 71.0b11 &rarr; b12 | **0.76s** | 4m 47s | 18.8s |
-| Chrome 78.0.3904.97 &rarr; 108 | **0.79s** | 3m 7s | 18.6s |
+| Test case | bidiff 2.0 | bidiff 1.1 | bsdiff | xdelta3 |
+|-----------|------------|------------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | **0.42s** | 29.8s | 3m 8s | 1.0s |
+| Linux 5.3 &rarr; 5.4 | **2.1s** | 4m 17s | 15m 6s | 8.5s |
+| Firefox 71.0b11 &rarr; b12 | **0.76s** | 1m 37s | 4m 47s | 18.8s |
+| Chrome 78.0.3904.97 &rarr; 108 | **0.79s** | 1m 23s | 3m 7s | 18.6s |
 
 #### Patch time
 
-| Test case | bidiff | bsdiff | xdelta3 |
-|-----------|--------|--------|---------|
-| Wine 4.18 &rarr; 4.19 | **0.13s** | 1.29s | 0.42s |
-| Linux 5.3 &rarr; 5.4 | **0.50s** | 8.8s | 2.1s |
-| Firefox 71.0b11 &rarr; b12 | **0.14s** | 2.4s | 1.5s |
-| Chrome 78.0.3904.97 &rarr; 108 | **0.11s** | 1.5s | 1.1s |
+| Test case | bidiff 2.0 | bidiff 1.1 | bsdiff | xdelta3 |
+|-----------|------------|------------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | **0.13s** | 0.69s | 1.29s | 0.42s |
+| Linux 5.3 &rarr; 5.4 | **0.50s** | 3.97s | 8.8s | 2.1s |
+| Firefox 71.0b11 &rarr; b12 | **0.14s** | 0.84s | 2.4s | 1.5s |
+| Chrome 78.0.3904.97 &rarr; 108 | **0.11s** | 0.53s | 1.5s | 1.1s |
 
-bsdiff produces the smallest patches (suffix array matching finds optimal matches) but is orders of magnitude slower to diff &mdash; 3&ndash;15 minutes vs bidiff's sub-second times. xdelta3 is faster than bsdiff but still 2&ndash;25x slower than bidiff and produces the largest patches. bidiff lands in the middle on patch size while being the fastest at both diffing and patching thanks to parallel scanning and parallel zstd decompression.
+bsdiff and bidiff 1.1 produce the smallest patches (suffix array matching) but are orders of magnitude slower to diff &mdash; minutes vs bidiff's sub-second times. xdelta3 is faster than bsdiff but still 2&ndash;25x slower than bidiff and produces the largest patches. bidiff 2.0 trades slightly larger patches for dramatically faster diffing and patching thanks to parallel hash-table scanning and parallel zstd decompression.
 
 ## Workspace structure
 
