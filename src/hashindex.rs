@@ -132,17 +132,13 @@ mod mmap_table {
         pub fn prefetch(&self, i: usize) {
             debug_assert!(i < self.len);
             // SAFETY: i < self.len (debug_assert above), pointer is within allocation.
+            #[cfg(target_arch = "x86_64")]
             let ptr = unsafe { (self.mmap.as_ptr() as *const u64).add(i) };
             #[cfg(target_arch = "x86_64")]
             // SAFETY: Prefetch is a CPU hint that cannot cause UB.
             // Invalid/unmapped addresses are silently ignored by the processor.
             unsafe {
                 std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-            }
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: Same as x86_64 — PRFM is a hint, cannot fault or cause UB.
-            unsafe {
-                std::arch::aarch64::_prefetch(ptr as *const i8, 0, 3);
             }
         }
     }

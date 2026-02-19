@@ -275,7 +275,7 @@ fn do_patch(
         .context("pre-size output file")?;
     let mut output_mmap =
         unsafe { memmap2::MmapMut::map_mut(&output_file) }.context("mmap output file")?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     output_mmap.advise(memmap2::Advice::HugePage).ok();
 
     // Apply chunks in parallel using rayon's thread pool for bounded parallelism.
@@ -307,7 +307,7 @@ fn mmap_file(path: &PathBuf) -> Result<Mmap> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mmap = unsafe { memmap2::MmapOptions::new().populate().map(&file) }
         .with_context(|| format!("mmap {}", path.display()))?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     mmap.advise(memmap2::Advice::HugePage).ok();
     Ok(mmap)
 }
