@@ -57,6 +57,39 @@ Smaller patches at the cost of much slower diff times. Patch application speed i
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 114ms | 61.5s | 62.5 MiB | 58.5s | 189 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 92ms | 78.4s | 57.6 MiB | 80.8s | 186 MiB |
 
+### Comparison with bsdiff and xdelta3
+
+All three tools with default settings. bsdiff 4.3, xdelta3 3.0.11 — both single-threaded. Same test system.
+
+#### Patch size
+
+| Test case | New size | bidiff | bsdiff | xdelta3 |
+|-----------|----------|--------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | 201 MiB | 249 KiB (0.12%) | 110 KiB (0.05%) | 256 KiB (0.12%) |
+| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.8 MiB (0.76%) | 5.0 MiB (0.56%) | 5.4 MiB (0.60%) |
+| Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB (5.49%) | 7.8 MiB (3.95%) | 21.7 MiB (10.95%) |
+| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB (5.71%) | 5.0 MiB (3.46%) | 18.7 MiB (12.87%) |
+
+#### Diff time
+
+| Test case | bidiff | bsdiff | xdelta3 |
+|-----------|--------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | 424ms | 188.2s | 1.0s |
+| Linux 5.3 &rarr; 5.4 | 2.1s | 906.0s | 8.5s |
+| Firefox 71.0b11 &rarr; b12 | 757ms | 287.2s | 18.8s |
+| Chrome 78.0.3904.97 &rarr; 108 | 789ms | 187.1s | 18.6s |
+
+#### Patch time
+
+| Test case | bidiff | bsdiff | xdelta3 |
+|-----------|--------|--------|---------|
+| Wine 4.18 &rarr; 4.19 | 125ms | 1,285ms | 418ms |
+| Linux 5.3 &rarr; 5.4 | 503ms | 8,804ms | 2,099ms |
+| Firefox 71.0b11 &rarr; b12 | 136ms | 2,448ms | 1,450ms |
+| Chrome 78.0.3904.97 &rarr; 108 | 110ms | 1,453ms | 1,139ms |
+
+bsdiff produces the smallest patches (suffix array matching finds optimal matches) but is orders of magnitude slower to diff &mdash; 188&ndash;906 seconds vs bidiff's sub-second times. xdelta3 is faster than bsdiff but still 2&ndash;25x slower than bidiff and produces the largest patches. bidiff lands in the middle on patch size while being the fastest at both diffing and patching thanks to parallel scanning and parallel zstd decompression.
+
 ## Workspace structure
 
 - **`bidiff`** (root) -- Library crate. Feature flags:
