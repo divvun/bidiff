@@ -35,7 +35,7 @@ bidiff cycle old_file new_file
 
 ## Benchmarks
 
-System: AMD Ryzen Threadripper 2950X (32 cores), 60 GiB RAM, Linux 6.12.
+### System: AMD Ryzen Threadripper 2950X (32 cores), 60 GiB RAM, Linux 6.12.
 
 Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing.
 
@@ -46,7 +46,7 @@ Default settings (1 MiB chunks, file-backed hash table). Memory column shows pea
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB | 5.49% | 0.14s | 0.76s | 18.6 MiB | 0.73s | 147 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB | 5.71% | 0.11s | 0.79s | 16.9 MiB | 0.75s | 147 MiB |
 
-### With `--max` (zstd level 22)
+#### With `--max` (zstd level 22)
 
 Smaller patches at the cost of much slower diff times. Patch application speed is similar.
 
@@ -56,6 +56,17 @@ Smaller patches at the cost of much slower diff times. Patch application speed i
 | Linux 5.3 &rarr; 5.4 | 895 MiB | 6.1 MiB | 0.68% | 0.52s | 1m 4s | 60.6 MiB | 1m 6s | 573 MiB |
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 0.11s | 1m 2s | 62.5 MiB | 58.5s | 189 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 0.09s | 1m 18s | 57.6 MiB | 1m 21s | 186 MiB |
+
+### System: Apple M2 Max (12 cores), 32 GiB RAM, macOS 26.1.
+
+Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing.
+
+| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
+|-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
+| Wine 4.18 → 4.19 | 201.4 MiB | 249 KiB | 0.120% | 0.194s | 0.258s | 25.7 MiB | 0.198s | 149.7 MiB |
+| Linux 5.3 → 5.4 | 894.7 MiB | 6.8 MiB | 0.762% | 0.918s | 1.400s | 51.0 MiB | 1.004s | 563.4 MiB |
+| Firefox 71.0b11 → b12 | 197.8 MiB | 10.9 MiB | 5.486% | 0.118s | 0.614s | 19.0 MiB | 0.578s | 147.9 MiB |
+| Chrome 78.0.3904.97 → 108 | 145.4 MiB | 57.0 MiB | 39.213% | 0.064s | 0.642s | 12.9 MiB | 0.640s | 13.0 MiB |
 
 ### Comparison with bidiff 1.1, bsdiff, and xdelta3
 

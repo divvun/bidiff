@@ -10,6 +10,39 @@ BIDIFF="$ROOT/target/release/bidiff"
 
 mkdir -p "$DATA"
 
+# Portable sha256 (Linux has sha256sum, macOS has shasum)
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+# ── System info ──────────────────────────────────────────────────────────────
+
+system_info() {
+    local cpu cores ram_gib os_name
+    case "$(uname -s)" in
+        Darwin)
+            cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+            cores=$(sysctl -n hw.ncpu 2>/dev/null)
+            ram_gib=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%g", $1 / 1073741824}')
+            os_name="$(sw_vers -productName) $(sw_vers -productVersion)"
+            ;;
+        Linux)
+            cpu=$(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')
+            cores=$(nproc)
+            ram_gib=$(awk '/MemTotal/ {printf "%g", $2 / 1048576}' /proc/meminfo)
+            os_name="Linux $(uname -r | cut -d- -f1)"
+            ;;
+        *)
+            cpu="unknown"; cores="?"; ram_gib="?"; os_name="$(uname -s)"
+            ;;
+    esac
+    echo "System: ${cpu} (${cores} cores), ${ram_gib} GiB RAM, ${os_name}."
+}
+
 # ── Download helpers ─────────────────────────────────────────────────────────
 
 download() {
@@ -21,7 +54,7 @@ download() {
     echo "  downloading: $(basename "$dest")"
     curl -fSL --progress-bar -o "$dest" "$url"
     local actual
-    actual=$(sha256sum "$dest" | cut -d' ' -f1)
+    actual=$(sha256 "$dest")
     if [ "$actual" != "$sha256" ]; then
         echo "ERROR: checksum mismatch for $dest"
         echo "  expected: $sha256"
@@ -88,9 +121,11 @@ extract_chrome() {
         return
     fi
     echo "  extracting: $(basename "$dest") from $(basename "$deb")"
-    dpkg-deb --fsys-tarfile "$deb" | tar xf - --to-stdout ./opt/google/chrome/chrome > "$dest"
+    local data_tar
+    data_tar=$(ar t "$deb" | grep '^data\.tar')
+    ar p "$deb" "$data_tar" | tar xf - -O ./opt/google/chrome/chrome > "$dest"
     local actual
-    actual=$(sha256sum "$dest" | cut -d' ' -f1)
+    actual=$(sha256 "$dest")
     if [ "$actual" != "$sha256" ]; then
         echo "ERROR: checksum mismatch for $dest"
         echo "  expected: $sha256"
@@ -157,12 +192,12 @@ add_pair "Chrome 78.0.3904.97 → 108" "$DATA/chrome-78.0.3904.97" "$DATA/chrome
 parse_cycle() {
     local line="$1"
     # Extract fields by keyword
-    PATCH_SIZE=$(echo "$line" | grep -oP 'patch \K[0-9.]+ [A-Za-z]+')
-    RATIO=$(echo "$line" | grep -oP '[0-9.]+(?=% of)')
-    NEW_SIZE=$(echo "$line" | grep -oP '% of \K[0-9.]+ [A-Za-z]+')
-    DTIME_RAW=$(echo "$line" | grep -oP 'dtime \K[0-9.]+[a-zµ]+')
-    PTIME_RAW=$(echo "$line" | grep -oP 'ptime \K[0-9.]+[a-zµ]+')
-    ANON=$(echo "$line" | grep -oP 'anon \K[0-9.]+ [A-Za-z]+' || echo "")
+    PATCH_SIZE=$(echo "$line" | grep -oE 'patch [0-9.]+ [A-Za-z]+' | sed 's/^patch //')
+    RATIO=$(echo "$line" | grep -oE '[0-9.]+% of' | sed 's/% of//')
+    NEW_SIZE=$(echo "$line" | grep -oE '% of [0-9.]+ [A-Za-z]+' | sed 's/^% of //')
+    DTIME_RAW=$(echo "$line" | grep -oE 'dtime [^ ]+' | sed 's/^dtime //')
+    PTIME_RAW=$(echo "$line" | grep -oE 'ptime [^ ]+' | sed 's/^ptime //')
+    ANON=$(echo "$line" | grep -oE 'anon [0-9.]+ [A-Za-z]+' | sed 's/^anon //' || echo "")
 }
 
 # Convert Rust Duration debug format to seconds
@@ -177,6 +212,16 @@ to_seconds() {
     else
         echo "$raw"
     fi
+}
+
+# Average a list of numeric values (passed as arguments)
+average() {
+    local sum=0 n=0
+    for v in "$@"; do
+        sum=$(awk "BEGIN {printf \"%.6f\", $sum + $v}")
+        n=$((n + 1))
+    done
+    awk "BEGIN {printf \"%.3f\", $sum / $n}"
 }
 
 # Format seconds for display: seconds if <60, Xm Ys if >=60
@@ -208,6 +253,15 @@ declare -a R_MEM=()
 declare -a R_DTIME_RAM=()
 declare -a R_MEM_RAM=()
 
+RUNS=5
+
+# On macOS, run one extra warmup iteration (discarded) to avoid prefetch distortion
+if [ "$(uname -s)" = "Darwin" ]; then
+    WARMUP=1
+else
+    WARMUP=0
+fi
+
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"
     older="${OLDERS[$i]}"
@@ -216,27 +270,59 @@ for i in "${!NAMES[@]}"; do
     echo ""
     echo "--- $name ---"
 
-    # Default mode (file-backed hash table)
-    echo "  file-backed + anon measurement..."
-    output=$("$BIDIFF" cycle "$older" "$newer" --with-anon 2>/dev/null)
-    echo "  $output"
-    parse_cycle "$output"
+    # Timing runs: 5x each, no --with-anon so numbers aren't contaminated
+    declare -a dtimes=() ptimes=() dtimes_ram=()
+
+    TOTAL=$((WARMUP + RUNS))
+    echo "  file-backed (timing, ${RUNS} runs)..."
+    for r in $(seq 1 $TOTAL); do
+        output=$("$BIDIFF" cycle "$older" "$newer" 2>/dev/null)
+        if [ "$r" -le "$WARMUP" ]; then
+            echo "    warmup: $output"
+            continue
+        fi
+        actual=$((r - WARMUP))
+        echo "    run $actual/$RUNS: $output"
+        parse_cycle "$output"
+        dtimes+=("$(to_seconds "$DTIME_RAW")")
+        ptimes+=("$(to_seconds "$PTIME_RAW")")
+    done
 
     R_NAME+=("$name")
     R_NEW_SIZE+=("$NEW_SIZE")
     R_PATCH_SIZE+=("$PATCH_SIZE")
     R_RATIO+=("$RATIO")
-    R_PTIME+=("$(to_seconds "$PTIME_RAW")")
-    R_DTIME+=("$(to_seconds "$DTIME_RAW")")
+    R_DTIME+=("$(average "${dtimes[@]}")")
+    R_PTIME+=("$(average "${ptimes[@]}")")
+
+    echo "  RAM (timing, ${RUNS} runs)..."
+    for r in $(seq 1 $TOTAL); do
+        output=$("$BIDIFF" cycle "$older" "$newer" --ram 2>/dev/null)
+        if [ "$r" -le "$WARMUP" ]; then
+            echo "    warmup: $output"
+            continue
+        fi
+        actual=$((r - WARMUP))
+        echo "    run $actual/$RUNS: $output"
+        parse_cycle "$output"
+        dtimes_ram+=("$(to_seconds "$DTIME_RAW")")
+    done
+
+    R_DTIME_RAM+=("$(average "${dtimes_ram[@]}")")
+
+    unset dtimes ptimes dtimes_ram
+
+    # Memory measurement runs (single run each, separate from timing)
+    echo "  file-backed (memory)..."
+    output=$("$BIDIFF" cycle "$older" "$newer" --with-anon 2>/dev/null)
+    echo "  $output"
+    parse_cycle "$output"
     R_MEM+=("$ANON")
 
-    # RAM mode
-    echo "  RAM mode + anon measurement..."
+    echo "  RAM (memory)..."
     output=$("$BIDIFF" cycle "$older" "$newer" --ram --with-anon 2>/dev/null)
     echo "  $output"
     parse_cycle "$output"
-
-    R_DTIME_RAM+=("$(to_seconds "$DTIME_RAW")")
     R_MEM_RAM+=("$ANON")
 done
 
@@ -244,25 +330,13 @@ done
 
 echo ""
 echo ""
-echo "=== Results ==="
+system_info
 echo ""
-printf "| %-28s | %8s | %12s | %6s | %10s | %10s | %10s | %15s | %12s |\n" \
-    "Test case" "New size" "Patch size" "Ratio" "Patch time" "Diff time" "Memory" "Diff time (RAM)" "Memory (RAM)"
-printf "|%-30s|%10s|%14s|%8s|%12s|%12s|%12s|%17s|%14s|\n" \
-    "------------------------------" "----------" "--------------" "--------" "------------" "------------" "------------" "-----------------" "--------------"
+echo "Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing."
+echo ""
+echo "| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |"
+echo "|-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|"
 
 for i in "${!R_NAME[@]}"; do
-    printf "| %-28s | %8s | %12s | %5s%% | %10s | %10s | %10s | %15s | %12s |\n" \
-        "${R_NAME[$i]}" \
-        "${R_NEW_SIZE[$i]}" \
-        "${R_PATCH_SIZE[$i]}" \
-        "${R_RATIO[$i]}" \
-        "$(fmt_time "${R_PTIME[$i]}")" \
-        "$(fmt_time "${R_DTIME[$i]}")" \
-        "${R_MEM[$i]}" \
-        "$(fmt_time "${R_DTIME_RAM[$i]}")" \
-        "${R_MEM_RAM[$i]}"
+    echo "| ${R_NAME[$i]} | ${R_NEW_SIZE[$i]} | ${R_PATCH_SIZE[$i]} | ${R_RATIO[$i]}% | $(fmt_time "${R_PTIME[$i]}") | $(fmt_time "${R_DTIME[$i]}") | ${R_MEM[$i]} | $(fmt_time "${R_DTIME_RAM[$i]}") | ${R_MEM_RAM[$i]} |"
 done
-
-echo ""
-echo "Done."

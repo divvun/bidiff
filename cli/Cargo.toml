@@ -25,3 +25,4 @@ rayon = "1.11"
 
 libc = "0.2"
 tempfile = "3"
+mach-sys = "0.5.4"

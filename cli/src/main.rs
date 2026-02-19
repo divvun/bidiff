@@ -83,8 +83,9 @@ struct Cycle {
     with_anon: bool,
 }
 
-/// Read anonymous RSS (heap + anonymous mmap) from /proc/self/status.
+/// Read anonymous RSS (heap + anonymous mmap).
 /// Excludes file-backed mmap pages — only counts "real" memory allocations.
+#[cfg(target_os = "linux")]
 fn read_rss_anon() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -98,6 +99,37 @@ fn read_rss_anon() -> u64 {
         })
         .map(|kb| kb * 1024)
         .unwrap_or(0)
+}
+
+/// Read anonymous RSS via mach task_info (TASK_VM_INFO).
+/// The `internal` field counts anonymous memory in bytes.
+#[cfg(target_os = "macos")]
+fn read_rss_anon() -> u64 {
+    use mach_sys::kern_return::KERN_SUCCESS;
+    use mach_sys::task::task_info;
+    use mach_sys::task_info::{task_vm_info_t, TASK_VM_INFO, TASK_VM_INFO_COUNT};
+    use mach_sys::traps::mach_task_self;
+    use std::mem::MaybeUninit;
+    unsafe {
+        let mut info = MaybeUninit::<task_vm_info_t>::uninit();
+        let mut count = TASK_VM_INFO_COUNT;
+        let kr = task_info(
+            mach_task_self(),
+            TASK_VM_INFO,
+            info.as_mut_ptr() as *mut _,
+            &mut count,
+        );
+        if kr != KERN_SUCCESS {
+            return 0;
+        }
+        let info = info.assume_init();
+        info.internal as u64
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_rss_anon() -> u64 {
+    0
 }
 
 fn format_size(bytes: u64) -> String {
