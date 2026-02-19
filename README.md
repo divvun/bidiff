@@ -41,10 +41,10 @@ Default settings (1 MiB chunks, file-backed hash table). Memory column shows pea
 
 | Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
 |-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
-| Wine 4.18 &rarr; 4.19 | 201 MiB | 249 KiB | 0.12% | 125ms | 424ms | 21.5 MiB | 380ms | 149 MiB |
-| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.8 MiB | 0.76% | 503ms | 2,132ms | 59.2 MiB | 1,811ms | 563 MiB |
-| Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB | 5.49% | 136ms | 757ms | 18.6 MiB | 730ms | 147 MiB |
-| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB | 5.71% | 110ms | 789ms | 16.9 MiB | 751ms | 147 MiB |
+| Wine 4.18 &rarr; 4.19 | 201 MiB | 249 KiB | 0.12% | 0.13s | 0.42s | 21.5 MiB | 0.38s | 149 MiB |
+| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.8 MiB | 0.76% | 0.50s | 2.13s | 59.2 MiB | 1.81s | 563 MiB |
+| Firefox 71.0b11 &rarr; b12 | 198 MiB | 10.9 MiB | 5.49% | 0.14s | 0.76s | 18.6 MiB | 0.73s | 147 MiB |
+| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 8.3 MiB | 5.71% | 0.11s | 0.79s | 16.9 MiB | 0.75s | 147 MiB |
 
 ### With `--max` (zstd level 22)
 
@@ -52,10 +52,10 @@ Smaller patches at the cost of much slower diff times. Patch application speed i
 
 | Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
 |-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
-| Wine 4.18 &rarr; 4.19 | 201 MiB | 203 KiB | 0.10% | 119ms | 3.7s | 60.9 MiB | 4.2s | 189 MiB |
-| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.1 MiB | 0.68% | 518ms | 64.3s | 60.6 MiB | 66.2s | 573 MiB |
-| Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 114ms | 61.5s | 62.5 MiB | 58.5s | 189 MiB |
-| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 92ms | 78.4s | 57.6 MiB | 80.8s | 186 MiB |
+| Wine 4.18 &rarr; 4.19 | 201 MiB | 203 KiB | 0.10% | 0.12s | 3.7s | 60.9 MiB | 4.2s | 189 MiB |
+| Linux 5.3 &rarr; 5.4 | 895 MiB | 6.1 MiB | 0.68% | 0.52s | 1m 4s | 60.6 MiB | 1m 6s | 573 MiB |
+| Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 0.11s | 1m 2s | 62.5 MiB | 58.5s | 189 MiB |
+| Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 0.09s | 1m 18s | 57.6 MiB | 1m 21s | 186 MiB |
 
 ### Comparison with bsdiff and xdelta3
 
@@ -74,21 +74,21 @@ All three tools with default settings. bsdiff 4.3, xdelta3 3.0.11 — both singl
 
 | Test case | bidiff | bsdiff | xdelta3 |
 |-----------|--------|--------|---------|
-| Wine 4.18 &rarr; 4.19 | **424ms** | 188.2s | 1.0s |
-| Linux 5.3 &rarr; 5.4 | **2.1s** | 906.0s | 8.5s |
-| Firefox 71.0b11 &rarr; b12 | **757ms** | 287.2s | 18.8s |
-| Chrome 78.0.3904.97 &rarr; 108 | **789ms** | 187.1s | 18.6s |
+| Wine 4.18 &rarr; 4.19 | **0.42s** | 3m 8s | 1.0s |
+| Linux 5.3 &rarr; 5.4 | **2.1s** | 15m 6s | 8.5s |
+| Firefox 71.0b11 &rarr; b12 | **0.76s** | 4m 47s | 18.8s |
+| Chrome 78.0.3904.97 &rarr; 108 | **0.79s** | 3m 7s | 18.6s |
 
 #### Patch time
 
 | Test case | bidiff | bsdiff | xdelta3 |
 |-----------|--------|--------|---------|
-| Wine 4.18 &rarr; 4.19 | **125ms** | 1,285ms | 418ms |
-| Linux 5.3 &rarr; 5.4 | **503ms** | 8,804ms | 2,099ms |
-| Firefox 71.0b11 &rarr; b12 | **136ms** | 2,448ms | 1,450ms |
-| Chrome 78.0.3904.97 &rarr; 108 | **110ms** | 1,453ms | 1,139ms |
+| Wine 4.18 &rarr; 4.19 | **0.13s** | 1.29s | 0.42s |
+| Linux 5.3 &rarr; 5.4 | **0.50s** | 8.8s | 2.1s |
+| Firefox 71.0b11 &rarr; b12 | **0.14s** | 2.4s | 1.5s |
+| Chrome 78.0.3904.97 &rarr; 108 | **0.11s** | 1.5s | 1.1s |
 
-bsdiff produces the smallest patches (suffix array matching finds optimal matches) but is orders of magnitude slower to diff &mdash; 188&ndash;906 seconds vs bidiff's sub-second times. xdelta3 is faster than bsdiff but still 2&ndash;25x slower than bidiff and produces the largest patches. bidiff lands in the middle on patch size while being the fastest at both diffing and patching thanks to parallel scanning and parallel zstd decompression.
+bsdiff produces the smallest patches (suffix array matching finds optimal matches) but is orders of magnitude slower to diff &mdash; 3&ndash;15 minutes vs bidiff's sub-second times. xdelta3 is faster than bsdiff but still 2&ndash;25x slower than bidiff and produces the largest patches. bidiff lands in the middle on patch size while being the fastest at both diffing and patching thanks to parallel scanning and parallel zstd decompression.
 
 ## Workspace structure
 
