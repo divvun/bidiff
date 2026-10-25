@@ -1,4 +1,7 @@
-use super::{ChunkRef, Error, MAX_WINDOW_LOG, Malformed, frame};
+use super::{
+    ChunkRef, Error, Hash, MAX_WINDOW_LOG, Malformed, frame,
+    hash::{BLOCK_LEN, BlockHasher},
+};
 use std::io::{self, ErrorKind, Write};
 use zstd::zstd_safe::{self, DCtx, DParameter, InBuffer, OutBuffer, ResetDirective};
 
@@ -9,8 +12,6 @@ pub(crate) const INSTRUCTION_BUF_LEN: usize = 128 * 1024;
 /// half this.
 #[cfg(any(feature = "rayon", test))]
 pub(crate) const DECODER_OVERHEAD: usize = 1 << 20;
-
-const OUTPUT_BUF_LEN: usize = 1024 * 1024;
 
 const MAX_VARINT_LEN: usize = 10;
 
@@ -78,66 +79,63 @@ impl Sink for SliceSink<'_> {
     }
 }
 
-pub(crate) struct WriteSink<'w, W: Write + ?Sized> {
+/// Gathers output into [`BLOCK_LEN`] blocks at aligned offsets, writing each
+/// to `out` before handing it to the hasher.
+pub(crate) struct WriteSink<'w, 'h, W: Write + ?Sized> {
     out: &'w mut W,
     buf: Vec<u8>,
-    hasher: blake3::Hasher,
+    hasher: &'h mut BlockHasher,
+    total: u64,
 }
 
-impl<'w, W: Write + ?Sized> WriteSink<'w, W> {
-    pub(crate) fn new(out: &'w mut W, new_size: u64) -> Self {
-        // `new_size` comes from the patch, so it only ever shrinks the buffer.
-        let cap = new_size.min(OUTPUT_BUF_LEN as u64) as usize;
-        Self {
+impl<'w, 'h, W: Write + ?Sized> WriteSink<'w, 'h, W> {
+    pub(crate) fn new(out: &'w mut W, hasher: &'h mut BlockHasher) -> Result<Self, Error> {
+        Ok(Self {
             out,
-            buf: Vec::with_capacity(cap),
-            hasher: blake3::Hasher::new(),
+            buf: hasher.buffer()?,
+            hasher,
+            total: 0,
+        })
+    }
+
+    /// Room left in the current block, after passing on a full one.
+    #[inline]
+    fn room(&mut self) -> Result<usize, Error> {
+        if self.buf.len() == BLOCK_LEN {
+            self.out.write_all(&self.buf).map_err(Error::Io)?;
+            let full = std::mem::take(&mut self.buf);
+            self.buf = self.hasher.push_full(full)?;
         }
+        Ok(BLOCK_LEN - self.buf.len())
     }
 
-    fn emit(out: &mut W, hasher: &mut blake3::Hasher, data: &[u8]) -> Result<(), Error> {
-        // Not update_rayon: called from outside the pool, each call waits on
-        // a worker handoff that costs more than it saves at this block size.
-        hasher.update(data);
-        out.write_all(data).map_err(Error::Io)
-    }
-
-    fn flush_buf(&mut self) -> Result<(), Error> {
-        if !self.buf.is_empty() {
-            Self::emit(self.out, &mut self.hasher, &self.buf)?;
-            self.buf.clear();
-        }
-        Ok(())
-    }
-
-    /// Flush everything and return the hash of all bytes written.
-    pub(crate) fn finish(mut self) -> Result<blake3::Hash, Error> {
-        self.flush_buf()?;
+    /// Write and flush everything, and return the hash of all of it.
+    pub(crate) fn finish(mut self) -> Result<Hash, Error> {
+        self.room()?;
+        self.out.write_all(&self.buf).map_err(Error::Io)?;
         self.out.flush().map_err(Error::Io)?;
-        Ok(self.hasher.finalize())
+        let last = std::mem::take(&mut self.buf);
+        self.hasher.finish(last, self.total)
     }
 }
 
-impl<W: Write + ?Sized> Sink for WriteSink<'_, W> {
+impl<W: Write + ?Sized> Sink for WriteSink<'_, '_, W> {
     #[inline]
-    fn copy(&mut self, src: &[u8]) -> Result<(), Error> {
-        if self.buf.len() + src.len() > OUTPUT_BUF_LEN {
-            self.flush_buf()?;
+    fn copy(&mut self, mut src: &[u8]) -> Result<(), Error> {
+        self.total += src.len() as u64;
+        while !src.is_empty() {
+            let n = self.room()?.min(src.len());
+            self.buf.extend_from_slice(&src[..n]);
+            src = &src[n..];
         }
-        if src.len() >= OUTPUT_BUF_LEN {
-            return Self::emit(self.out, &mut self.hasher, src);
-        }
-        self.buf.extend_from_slice(src);
         Ok(())
     }
 
     #[inline]
     fn add(&mut self, mut delta: &[u8], mut old: &[u8]) -> Result<(), Error> {
+        self.total += delta.len() as u64;
         while !delta.is_empty() {
-            if self.buf.len() == OUTPUT_BUF_LEN {
-                self.flush_buf()?;
-            }
-            let n = (OUTPUT_BUF_LEN - self.buf.len()).min(delta.len());
+            let n = self.room()?.min(delta.len());
             self.buf.extend(
                 delta[..n]
                     .iter()

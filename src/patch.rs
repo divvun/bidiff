@@ -53,6 +53,7 @@ use std::io::{self, ErrorKind, Write};
 mod decode;
 mod error;
 mod frame;
+mod hash;
 
 pub use blake3::Hash;
 pub use error::{Error, Malformed};
@@ -298,17 +299,23 @@ impl VerifiedBase<'_, '_> {
     /// Apply the patch, streaming the result to `out`, then check the
     /// result's hash.
     ///
-    /// Memory use is bounded by fixed buffers and zstd's window limit, not by
-    /// `new_size`. On any error `out` may already hold part or all of the
-    /// result, so it must be discarded.
+    /// Results over 4 MiB are hashed on up to four helper threads while they
+    /// are applied. Memory use does not depend on `new_size`: one decoder of
+    /// at most 2^[`MAX_WINDOW_LOG`] bytes plus 1 MiB, up to ten 1 MiB output
+    /// blocks, and 32 bytes per MiB written for the hash tree. On any error
+    /// `out` may already hold part or all of the result, so it must be
+    /// discarded.
     pub fn apply<W: Write + ?Sized>(&self, out: &mut W) -> Result<(), Error> {
         let mut dec = decode::decoder()?;
         let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
-        let mut sink = decode::WriteSink::new(out, self.patch.new_size);
-        for chunk in &self.patch.chunks {
-            decode::run_chunk(chunk, self.old, &mut dec, &mut buf, &mut sink)?;
-        }
-        self.patch.check_result(sink.finish()?)
+        let actual = hash::with_block_hasher(self.patch.new_size, |hasher| {
+            let mut sink = decode::WriteSink::new(out, hasher)?;
+            for chunk in &self.patch.chunks {
+                decode::run_chunk(chunk, self.old, &mut dec, &mut buf, &mut sink)?;
+            }
+            sink.finish()
+        })?;
+        self.patch.check_result(actual)
     }
 
     /// Apply the patch into `out`, which must be exactly

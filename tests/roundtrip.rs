@@ -89,3 +89,16 @@ fn copy_from_old_instructions() {
     let patch = single_chunk_patch(&old, &expected, 0, &stream);
     assert_eq!(apply_stream(&old, &patch).unwrap(), expected);
 }
+
+#[test]
+fn hashed_on_helper_threads() {
+    // Results over 4 MiB are hashed in 1 MiB blocks on helper threads; these
+    // land on, just under and just over block boundaries.
+    let mib = 1 << 20;
+    let mut rng = Rng(23);
+    let (old, base_new) = related_pair(&mut rng, 6 * mib + 4096);
+    for len in [4 * mib + 1, 5 * mib - 1, 5 * mib, 6 * mib + 1] {
+        let new = &base_new[..len];
+        check_round_trip(&old, new, Some(mib), 32);
+    }
+}
