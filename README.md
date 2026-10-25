@@ -9,6 +9,8 @@ Instead of suffix arrays, `bidiff` uses a hash-table index with:
 - **Parallel construction** via lock-free CAS insertion
 - **Parallel scanning** via rayon with ring-buffer channels for streaming matches
 - **Chunked patch format** with independent zstd-compressed chunks for parallel patch application
+- **Integrity checks**: the patch header carries the size and BLAKE3 hash of the base and of the result, so applying refuses a wrong base before writing anything and checks the result afterwards. The hashes match `b3sum`.
+- **Safe on malformed input**: corrupt, truncated or forged patches return errors rather than panicking, and memory use stays bounded (at most zstd's 128 MiB window per decoder) whatever sizes a patch declares
 
 ## Usage
 
@@ -21,7 +23,12 @@ bidiff patch old_file patch_file output_file
 
 # Round-trip verification (diff then patch, verifies hash match)
 bidiff cycle old_file new_file
+
+# Show a patch's format version and its base and result sizes and hashes
+bidiff info patch_file
 ```
+
+The patch format is documented in the `bidiff::patch` module. Version `0x2001` added the hashes; older patches are refused with an "unsupported version" error.
 
 ### Options
 
@@ -105,9 +112,11 @@ bsdiff and bidiff 1.1 produce the smallest patches (suffix array matching) but a
 
 - **`bidiff`** (root) -- Library crate. Feature flags:
   - `diff` -- diffing engine (rayon, ringbuf, memmap2, tempfile)
-  - `patch` -- patch encoding and application (integer-encoding, zstd)
+  - `patch` -- patch encoding and application (integer-encoding, zstd, blake3)
   - Both enabled by default.
-- **`bidiff-cli`** (`cli/`) -- CLI binary with `diff`, `patch`, and `cycle` subcommands.
+  - `rayon` -- parallel hashing and parallel `apply_to_slice` (enabled by `diff`)
+- **`bidiff-cli`** (`cli/`) -- CLI binary with `diff`, `patch`, `cycle`, and `info` subcommands.
+- **`fuzz/`** -- a `cargo fuzz` target for patch application; see `fuzz/fuzz_targets/apply.rs`.
 
 ## License
 

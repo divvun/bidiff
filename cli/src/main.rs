@@ -28,6 +28,9 @@ enum Command {
     Patch(Patch),
     /// Round-trip verification (diff then patch)
     Cycle(Cycle),
+    /// Print a patch's format version and the sizes and BLAKE3 hashes of its
+    /// base and result
+    Info(Info),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -57,6 +60,11 @@ struct Patch {
     older: PathBuf,
     patch: PathBuf,
     output: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct Info {
+    patch: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -155,6 +163,9 @@ fn main() -> Result<()> {
         }
         Command::Cycle(args) => {
             do_cycle(&args)?;
+        }
+        Command::Info(args) => {
+            do_info(&args)?;
         }
     }
 
@@ -329,6 +340,16 @@ fn write_output(
         std::fs::remove_file(path).ok();
     }
     result
+}
+
+fn do_info(Info { patch }: &Info) -> Result<()> {
+    let data = mmap_file(patch)?;
+    let patch = bidiff::patch::read_patch(&data).context("read patch")?;
+    println!("format  {:#X}", bidiff::VERSION);
+    println!("base    {}  {} bytes", patch.old_hash(), patch.old_size());
+    println!("result  {}  {} bytes", patch.new_hash(), patch.new_size());
+    println!("chunks  {}", patch.chunks().len());
+    Ok(())
 }
 
 fn mmap_file(path: &PathBuf) -> Result<Mmap> {
