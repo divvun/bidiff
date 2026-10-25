@@ -407,7 +407,58 @@ fn decode_in_parallel(regions: Vec<(&ChunkRef<'_>, &mut [u8])>, old: &[u8]) -> R
     })
 }
 
+#[cfg(feature = "mmap")]
+impl VerifiedBase<'_, '_> {
+    /// Apply the patch into `file`, which this sets to exactly
+    /// [`new_size`](PatchRef::new_size) bytes and memory-maps, then check the
+    /// result's hash and return it.
+    ///
+    /// `file` must be open for both reading and writing, as a writable shared
+    /// mapping needs; [`File::create`](std::fs::File::create) opens for
+    /// writing only. Chunks are applied in parallel with the `rayon` feature,
+    /// as in [`apply_to_slice`](Self::apply_to_slice).
+    ///
+    /// The caller owns the file and its cleanup. On any error it may hold part
+    /// of the result or wrong bytes and should be deleted; a
+    /// `tempfile::NamedTempFile` does that when dropped. The bytes are in the
+    /// page cache when this returns; call [`File::sync_all`](std::fs::File::sync_all)
+    /// for durability. Not starting writeback here saves 40 to 70 ms per
+    /// 200 MB on macOS, where `msync` is costly even when asynchronous.
+    ///
+    /// Nothing else may write to or truncate the file during the call: that
+    /// would change memory this function is reading and writing.
+    pub fn apply_to_file(&self, file: &std::fs::File) -> Result<Hash, Error> {
+        let new_size = self.patch.new_size;
+        if usize::try_from(new_size).is_err() {
+            return Err(Error::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("a {new_size}-byte result cannot be mapped on this platform"),
+            )));
+        }
+        file.set_len(new_size).map_err(Error::Io)?;
+        if new_size == 0 {
+            // memmap2 fakes empty maps with a one-byte map, which an empty
+            // file cannot back.
+            self.apply_to_slice(&mut [])?;
+            return Ok(self.patch.new_hash);
+        }
+        // SAFETY: the mapping lives only for this call, and the documented
+        // contract is that nothing else modifies or truncates the file
+        // meanwhile; its length was just set to new_size.
+        let mut map = unsafe { memmap2::MmapMut::map_mut(file) }.map_err(Error::Io)?;
+        self.apply_to_slice(&mut map)?;
+        Ok(self.patch.new_hash)
+    }
+}
+
 impl PatchRef<'_> {
+    /// [`verify_base`](Self::verify_base), then
+    /// [`VerifiedBase::apply_to_file`]. A wrong base leaves `file` untouched.
+    #[cfg(feature = "mmap")]
+    pub fn apply_to_file(&self, old: &[u8], file: &std::fs::File) -> Result<Hash, Error> {
+        self.verify_base(old)?.apply_to_file(file)
+    }
+
     fn check_result(&self, actual: Hash) -> Result<(), Error> {
         if actual == self.new_hash {
             Ok(())

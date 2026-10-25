@@ -188,6 +188,8 @@ fn mutated_patches_never_panic() {
     let cases = cases(&mut rng);
 
     let (mut errors, mut ok) = (0usize, 0usize);
+    #[cfg(feature = "mmap")]
+    let file = tempfile::tempfile().unwrap();
     for i in 0..n {
         let case = &cases[i % cases.len()];
         let mutant = mutate(&mut rng, &case.patch);
@@ -203,6 +205,17 @@ fn mutated_patches_never_panic() {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let streamed = apply_stream_capped(old, &mutant, OUTPUT_CAP);
             let sliced = apply_slice(old, &mutant, OUTPUT_CAP as u64);
+            #[cfg(feature = "mmap")]
+            if let Ok(p) = read_patch(&mutant)
+                && p.new_size() <= OUTPUT_CAP as u64
+            {
+                let filed = p.apply_to_file(old, &file);
+                assert_eq!(
+                    filed.is_ok(),
+                    streamed.is_ok(),
+                    "mutant {i}: file path disagrees"
+                );
+            }
             // apply_chunk skips the base check, so the decoder also meets
             // bases the patch was not made for.
             if let Ok(p) = read_patch(&mutant) {

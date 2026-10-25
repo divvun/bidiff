@@ -308,8 +308,9 @@ fn do_patch(
     let older = mmap_file(older)?;
     let base = patch.verify_base(&older).context("check base file")?;
 
-    write_output(output, patch.new_size(), |out| {
-        base.apply_to_slice(out).context("apply patch")
+    write_output(output, patch.new_size(), |file| {
+        base.apply_to_file(file).context("apply patch")?;
+        Ok(())
     })?;
 
     info!("Completed in {:?}", start.elapsed());
@@ -317,13 +318,10 @@ fn do_patch(
     Ok(())
 }
 
-/// Create `path` as a `size`-byte mmap and fill it with `fill`. The file is
-/// removed if `fill` fails, so a bad patch leaves no plausible-looking output.
-fn write_output(
-    path: &PathBuf,
-    size: u64,
-    fill: impl FnOnce(&mut [u8]) -> Result<()>,
-) -> Result<()> {
+/// Create `path`, pre-size it to `size` bytes and fill it with `fill`. The
+/// file is removed if `fill` fails, so a bad patch leaves no
+/// plausible-looking output.
+fn write_output(path: &PathBuf, size: u64, fill: impl FnOnce(&File) -> Result<()>) -> Result<()> {
     let output_file = File::options()
         .read(true)
         .write(true)
@@ -331,32 +329,28 @@ fn write_output(
         .truncate(true)
         .open(path)
         .context("create output file")?;
-    let result = (|| {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            // fallocate pre-allocates disk blocks, avoiding per-page block allocation during writes.
-            // Falls back to ftruncate on failure (e.g. tmpfs).
-            let len = i64::try_from(size).context("output size")?;
-            if unsafe { libc::fallocate(output_file.as_raw_fd(), 0, 0, len) } != 0 {
-                output_file.set_len(size).context("pre-size output file")?;
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        output_file.set_len(size).context("pre-size output file")?;
-        let mut output_mmap =
-            unsafe { memmap2::MmapMut::map_mut(&output_file) }.context("mmap output file")?;
-        #[cfg(target_os = "linux")]
-        output_mmap.advise(memmap2::Advice::HugePage).ok();
-
-        fill(&mut output_mmap)?;
-        output_mmap.flush_async().context("flush output mmap")
-    })();
+    let result = presize(&output_file, size).and_then(|()| fill(&output_file));
     if result.is_err() {
         drop(output_file);
         std::fs::remove_file(path).ok();
     }
     result
+}
+
+fn presize(file: &File, size: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // fallocate pre-allocates disk blocks, avoiding per-page block allocation during writes.
+        // Falls back to ftruncate on failure (e.g. tmpfs).
+        let len = i64::try_from(size).context("output size")?;
+        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len) } != 0 {
+            file.set_len(size).context("pre-size output file")?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, size);
+    Ok(())
 }
 
 fn do_info(Info { patch }: &Info) -> Result<()> {

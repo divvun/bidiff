@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 blake3 = "1.8"
+tempfile = "3"
 
 [dependencies.bidiff]
 path = ".."

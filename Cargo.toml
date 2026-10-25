@@ -8,10 +8,11 @@ edition = "2024"
 repository = "https://github.com/divvun/bidiff"
 
 [features]
-default = ["diff", "patch"]
-diff = ["rayon", "ringbuf", "memmap2", "tempfile"]
+default = ["diff", "patch", "mmap"]
+diff = ["rayon", "ringbuf", "dep:memmap2", "tempfile"]
 patch = ["integer-encoding", "zstd", "dep:blake3"]
 rayon = ["dep:rayon", "blake3?/rayon"]
+mmap = ["patch", "dep:memmap2"]
 instructions = []
 profiling = []
 
@@ -29,6 +30,7 @@ blake3 = { version = "1.8", optional = true }
 proptest = "1"
 zstd = "0.13"
 blake3 = "1.8"
+tempfile = "3"
 
 [workspace]
 members = ["cli"]

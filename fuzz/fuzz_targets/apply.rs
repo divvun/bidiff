@@ -12,9 +12,17 @@
 
 use bidiff::patch::{apply_chunk, read_patch};
 use libfuzzer_sys::fuzz_target;
-use std::io::{self, Write};
+use std::{
+    fs::File,
+    io::{self, Read, Seek, Write},
+    sync::{LazyLock, Mutex},
+};
 
 const OUTPUT_CAP: u64 = 1 << 22;
+
+/// Unlinked as soon as it is created, so fuzzing leaves no files behind.
+static OUTPUT_FILE: LazyLock<Mutex<File>> =
+    LazyLock::new(|| Mutex::new(tempfile::tempfile().expect("create a temporary file")));
 
 struct Capped(Vec<u8>);
 
@@ -55,6 +63,17 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(streamed_ok, sliced_ok);
         if sliced_ok {
             assert_eq!(sliced, streamed.0);
+        }
+
+        let mut file = OUTPUT_FILE.lock().unwrap();
+        let filed = p.apply_to_file(old, &file);
+        assert_eq!(streamed_ok, filed.is_ok());
+        if let Ok(hash) = filed {
+            assert_eq!(hash, p.new_hash());
+            let mut written = Vec::new();
+            file.rewind().unwrap();
+            file.read_to_end(&mut written).unwrap();
+            assert_eq!(written, streamed.0);
         }
     }
 

@@ -116,8 +116,9 @@ bsdiff and bidiff 1.1 produce the smallest patches (suffix array matching) but a
 - **`bidiff`** (root) -- Library crate. Feature flags:
   - `diff` -- diffing engine (rayon, ringbuf, memmap2, tempfile)
   - `patch` -- patch encoding and application (integer-encoding, zstd, blake3)
-  - Both enabled by default.
   - `rayon` -- parallel hashing and parallel `apply_to_slice` (enabled by `diff`)
+  - `mmap` -- `apply_to_file`, which applies into a memory-mapped output file of the declared size
+  - `diff`, `patch` and `mmap` are enabled by default.
 - **`bidiff-cli`** (`cli/`) -- CLI binary with `diff`, `patch`, `cycle`, and `info` subcommands.
 - **`fuzz/`** -- a `cargo fuzz` target for patch application; see `fuzz/fuzz_targets/apply.rs`.
 
