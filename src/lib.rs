@@ -1,5 +1,7 @@
 pub const MAGIC: u32 = 0xB1DF;
-pub const VERSION: u32 = 0x2000;
+/// Patch format version. 0x2001 is the first to carry base and result
+/// hashes; patches of any other version are refused, not misread.
+pub const VERSION: u32 = 0x2001;
 
 #[cfg(feature = "diff")]
 use rayon::prelude::*;
@@ -691,7 +693,7 @@ pub fn simple_diff_chunked_with_params(
         )
     })?;
 
-    patch::write_header(out, newer.len() as u64, num_chunks)?;
+    patch::write_header(out, older, newer, num_chunks)?;
 
     diff_chunked(
         older,

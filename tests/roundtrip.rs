@@ -9,7 +9,10 @@ use proptest::prelude::*;
 fn check_round_trip(old: &[u8], new: &[u8], scan_chunk: Option<usize>, block: usize) {
     let patch = make_patch(old, new, scan_chunk, block);
     let p = read_patch(&patch).unwrap();
+    assert_eq!(p.old_size(), old.len() as u64);
+    assert_eq!(p.old_hash(), blake3::hash(old));
     assert_eq!(p.new_size(), new.len() as u64);
+    assert_eq!(p.new_hash(), blake3::hash(new));
 
     let streamed = apply_stream(old, &patch).unwrap();
     assert!(streamed == new, "streamed output differs");

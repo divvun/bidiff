@@ -9,8 +9,13 @@
 //! |--------|------|-----------------------------------------|
 //! | 0      | 4    | magic, [`MAGIC`]                        |
 //! | 4      | 4    | format version, [`VERSION`]             |
-//! | 8      | 8    | `new_size`: length of the result        |
-//! | 16     | 4    | `num_chunks`                            |
+//! | 8      | 8    | `old_size`: length of the base          |
+//! | 16     | 32   | `old_hash`: BLAKE3 of the base          |
+//! | 48     | 8    | `new_size`: length of the result        |
+//! | 56     | 32   | `new_hash`: BLAKE3 of the result        |
+//! | 88     | 4    | `num_chunks`                            |
+//!
+//! The hashes are plain BLAKE3, as printed by `b3sum`.
 //!
 //! Each chunk is 40 bytes of metadata followed by its data:
 //!
@@ -45,6 +50,7 @@ use std::io::{self, ErrorKind, Write};
 mod decode;
 mod error;
 
+pub use blake3::Hash;
 pub use error::{Error, Malformed};
 
 const CHUNK_META_LEN: usize = 40;
@@ -53,7 +59,10 @@ const CHUNK_META_LEN: usize = 40;
 ///
 /// Chunk data is borrowed from the patch bytes.
 pub struct PatchRef<'a> {
+    old_size: u64,
+    old_hash: Hash,
     new_size: u64,
+    new_hash: Hash,
     chunks: Vec<ChunkRef<'a>>,
 }
 
@@ -73,6 +82,7 @@ impl ChunkRef<'_> {
         self.index
     }
 
+    /// Base offset the chunk's first instruction reads from.
     pub fn old_start(&self) -> u64 {
         self.old_start
     }
@@ -138,7 +148,10 @@ pub fn read_patch(data: &[u8]) -> Result<PatchRef<'_>, Error> {
     if version != VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
+    let old_size = c.u64()?;
+    let old_hash = Hash::from_bytes(c.array()?);
     let new_size = c.u64()?;
+    let new_hash = Hash::from_bytes(c.array()?);
     let num_chunks = c.u32()?;
     if num_chunks as usize > c.remaining() / CHUNK_META_LEN {
         return Err(Malformed::ChunkCount {
@@ -180,46 +193,115 @@ pub fn read_patch(data: &[u8]) -> Result<PatchRef<'_>, Error> {
         return Err(Malformed::TrailingData { offset: c.off }.into());
     }
 
-    Ok(PatchRef { new_size, chunks })
+    Ok(PatchRef {
+        old_size,
+        old_hash,
+        new_size,
+        new_hash,
+        chunks,
+    })
 }
 
 impl<'a> PatchRef<'a> {
+    /// Length of the base the patch was made from.
+    pub fn old_size(&self) -> u64 {
+        self.old_size
+    }
+
+    /// BLAKE3 hash of the base the patch was made from.
+    pub fn old_hash(&self) -> Hash {
+        self.old_hash
+    }
+
     /// Length of the result, as declared by the patch.
     pub fn new_size(&self) -> u64 {
         self.new_size
+    }
+
+    /// BLAKE3 hash of the result, as declared by the patch. Compare it with
+    /// an independent expectation before applying: applying only proves the
+    /// result matches this value.
+    pub fn new_hash(&self) -> Hash {
+        self.new_hash
     }
 
     pub fn chunks(&self) -> &[ChunkRef<'a>] {
         &self.chunks
     }
 
-    /// Apply the patch to `old`, streaming the result to `out`.
-    ///
-    /// Memory use is bounded by fixed buffers and zstd's window limit, not by
-    /// `new_size`. On error, `out` may already hold part of the result.
-    pub fn apply<W: Write + ?Sized>(&self, old: &[u8], out: &mut W) -> Result<(), Error> {
-        let mut dec = decode::decoder()?;
-        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
-        let mut sink = decode::WriteSink::new(out, self.new_size);
-        for chunk in &self.chunks {
-            decode::run_chunk(chunk, old, &mut dec, &mut buf, &mut sink)?;
+    /// Check that `old` is the base this patch was made from: its size first,
+    /// then its BLAKE3 hash.
+    pub fn verify_base<'s>(&'s self, old: &'s [u8]) -> Result<VerifiedBase<'s, 'a>, Error> {
+        let mismatch = |actual_hash| Error::BaseMismatch {
+            expected_size: self.old_size,
+            actual_size: old.len() as u64,
+            expected_hash: self.old_hash,
+            actual_hash,
+        };
+        if old.len() as u64 != self.old_size {
+            return Err(mismatch(None));
         }
-        sink.finish()
+        let actual = hash(old);
+        if actual != self.old_hash {
+            return Err(mismatch(Some(actual)));
+        }
+        Ok(VerifiedBase { patch: self, old })
     }
 
-    /// Apply the patch to `old`, writing the result into `out`, which must be
-    /// exactly [`new_size`](Self::new_size) bytes long.
+    /// [`verify_base`](Self::verify_base), then [`VerifiedBase::apply`].
+    pub fn apply<W: Write + ?Sized>(&self, old: &[u8], out: &mut W) -> Result<(), Error> {
+        self.verify_base(old)?.apply(out)
+    }
+
+    /// [`verify_base`](Self::verify_base), then [`VerifiedBase::apply_to_slice`].
+    pub fn apply_to_slice(&self, old: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        self.verify_base(old)?.apply_to_slice(out)
+    }
+}
+
+/// A patch and a base whose size and hash match it.
+pub struct VerifiedBase<'s, 'a> {
+    patch: &'s PatchRef<'a>,
+    old: &'s [u8],
+}
+
+impl VerifiedBase<'_, '_> {
+    /// Apply the patch, streaming the result to `out`, then check the
+    /// result's hash.
+    ///
+    /// Memory use is bounded by fixed buffers and zstd's window limit, not by
+    /// `new_size`. On any error `out` may already hold part or all of the
+    /// result, so it must be discarded.
+    pub fn apply<W: Write + ?Sized>(&self, out: &mut W) -> Result<(), Error> {
+        let mut dec = decode::decoder()?;
+        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+        let mut sink = decode::WriteSink::new(out, self.patch.new_size);
+        for chunk in &self.patch.chunks {
+            decode::run_chunk(chunk, self.old, &mut dec, &mut buf, &mut sink)?;
+        }
+        self.patch.check_result(sink.finish()?)
+    }
+
+    /// Apply the patch into `out`, which must be exactly
+    /// [`new_size`](PatchRef::new_size) bytes long, then check the result's
+    /// hash.
     ///
     /// With the `rayon` feature, chunks are applied in parallel.
-    pub fn apply_to_slice(&self, old: &[u8], out: &mut [u8]) -> Result<(), Error> {
-        if out.len() as u64 != self.new_size {
-            return Err(wrong_output_len(out.len(), self.new_size));
+    pub fn apply_to_slice(&self, out: &mut [u8]) -> Result<(), Error> {
+        let (patch, old) = (self.patch, self.old);
+        if out.len() as u64 != patch.new_size {
+            return Err(wrong_output_len(out.len(), patch.new_size));
         }
-        let mut regions = Vec::with_capacity(self.chunks.len());
-        let mut rest = out;
-        for chunk in &self.chunks {
-            // read_patch checked that the chunks sum to new_size, which is out.len().
-            let (region, tail) = rest.split_at_mut(chunk.new_len as usize);
+        let mut regions = Vec::with_capacity(patch.chunks.len());
+        let mut rest = &mut *out;
+        for chunk in &patch.chunks {
+            let split = usize::try_from(chunk.new_len)
+                .ok()
+                .and_then(|len| rest.split_at_mut_checked(len));
+            // read_patch checked that the chunks tile new_size, which is out.len().
+            let Some((region, tail)) = split else {
+                return Err(Malformed::ChunkLayout { chunk: chunk.index }.into());
+            };
             regions.push((chunk, region));
             rest = tail;
         }
@@ -238,7 +320,7 @@ impl<'a> PatchRef<'a> {
                     };
                     decode::run_chunk(chunk, old, dec, buf, &mut decode::SliceSink::new(region))
                 },
-            )
+            )?;
         }
         #[cfg(not(feature = "rayon"))]
         {
@@ -248,9 +330,36 @@ impl<'a> PatchRef<'a> {
                 let mut sink = decode::SliceSink::new(region);
                 decode::run_chunk(chunk, old, &mut dec, &mut buf, &mut sink)?;
             }
+        }
+
+        patch.check_result(hash(out))
+    }
+}
+
+impl PatchRef<'_> {
+    fn check_result(&self, actual: Hash) -> Result<(), Error> {
+        if actual == self.new_hash {
             Ok(())
+        } else {
+            Err(Error::ResultMismatch {
+                expected: self.new_hash,
+                actual,
+            })
         }
     }
+}
+
+/// `update_rayon` is slower than `update` below about 128 KiB.
+#[cfg(feature = "rayon")]
+const PARALLEL_HASH_MIN: usize = 128 * 1024;
+
+/// BLAKE3 of `data`, on several cores with the `rayon` feature.
+pub(crate) fn hash(data: &[u8]) -> Hash {
+    #[cfg(feature = "rayon")]
+    if data.len() >= PARALLEL_HASH_MIN {
+        return blake3::Hasher::new().update_rayon(data).finalize();
+    }
+    blake3::hash(data)
 }
 
 fn wrong_output_len(actual: usize, expected: u64) -> Error {
@@ -262,6 +371,10 @@ fn wrong_output_len(actual: usize, expected: u64) -> Error {
 
 /// Apply one chunk to `old`, writing into `out`, which must be exactly
 /// [`new_len`](ChunkRef::new_len) bytes long.
+///
+/// This checks neither the base's hash nor the result's. Callers that apply
+/// chunks themselves must call [`PatchRef::verify_base`] first and compare
+/// the assembled result with [`PatchRef::new_hash`]; [`VerifiedBase`] does both.
 pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], out: &mut [u8]) -> Result<(), Error> {
     if out.len() as u64 != chunk.new_len {
         return Err(wrong_output_len(out.len(), chunk.new_len));
@@ -278,10 +391,19 @@ pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], out: &mut [u8]) -> Result<(
 }
 
 #[cfg(feature = "diff")]
-pub(crate) fn write_header(out: &mut dyn Write, new_size: u64, num_chunks: u32) -> io::Result<()> {
+pub(crate) fn write_header(
+    out: &mut dyn Write,
+    old: &[u8],
+    new: &[u8],
+    num_chunks: u32,
+) -> io::Result<()> {
+    let (old_hash, new_hash) = rayon::join(|| hash(old), || hash(new));
     out.write_all(&MAGIC.to_le_bytes())?;
     out.write_all(&VERSION.to_le_bytes())?;
-    out.write_all(&new_size.to_le_bytes())?;
+    out.write_all(&(old.len() as u64).to_le_bytes())?;
+    out.write_all(old_hash.as_bytes())?;
+    out.write_all(&(new.len() as u64).to_le_bytes())?;
+    out.write_all(new_hash.as_bytes())?;
     out.write_all(&num_chunks.to_le_bytes())
 }
 

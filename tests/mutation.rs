@@ -37,6 +37,7 @@ const INTERESTING_U64: &[u64] = &[
 
 struct Case {
     old: Vec<u8>,
+    new: Vec<u8>,
     patch: Vec<u8>,
 }
 
@@ -52,12 +53,12 @@ fn cases(rng: &mut Rng) -> Vec<Case> {
     ] {
         let (old, new) = related_pair(rng, len);
         let patch = make_patch(&old, &new, scan_chunk, block);
-        cases.push(Case { old, patch });
+        cases.push(Case { old, new, patch });
     }
     let old = rng.bytes(1500);
     let new = rng.bytes(1700);
     let patch = make_patch(&old, &new, Some(500), 4);
-    cases.push(Case { old, patch });
+    cases.push(Case { old, new, patch });
     cases
 }
 
@@ -130,6 +131,7 @@ fn mutate(rng: &mut Rng, patch: &[u8]) -> Vec<u8> {
             // A header field.
             let fields = [
                 (layout::VERSION, 4),
+                (layout::OLD_SIZE, 8),
                 (layout::NEW_SIZE, 8),
                 (layout::NUM_CHUNKS, 4),
             ];
@@ -217,8 +219,12 @@ fn mutated_patches_never_panic() {
                 _ => panic!("mutant {i}: streamed {streamed:?} but sliced {sliced:?}"),
             }
         }
+        // The result hash makes any accepted output the real one.
         match streamed {
-            Ok(_) => ok += 1,
+            Ok(out) => {
+                assert!(out == case.new, "mutant {i}: accepted with wrong output");
+                ok += 1;
+            }
             Err(_) => errors += 1,
         }
     }

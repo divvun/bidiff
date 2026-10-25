@@ -9,9 +9,12 @@ use std::io::{self, Write};
 /// Byte offsets of header fields, per the format table in `bidiff::patch`.
 pub mod layout {
     pub const VERSION: usize = 4;
-    pub const NEW_SIZE: usize = 8;
-    pub const NUM_CHUNKS: usize = 16;
-    pub const HEADER_LEN: usize = 20;
+    pub const OLD_SIZE: usize = 8;
+    pub const OLD_HASH: usize = 16;
+    pub const NEW_SIZE: usize = 48;
+    pub const NEW_HASH: usize = 56;
+    pub const NUM_CHUNKS: usize = 88;
+    pub const HEADER_LEN: usize = 92;
     pub const CHUNK_META_LEN: usize = 40;
 
     // Offsets within a chunk's metadata.
@@ -134,14 +137,17 @@ pub fn replace_instructions(p: &[u8], chunk_at: usize, instructions: &[u8]) -> V
     out
 }
 
-/// Build a one-chunk patch from a raw instruction stream.
+/// Build a one-chunk patch from a raw instruction stream, declaring the
+/// hashes of `old` and `new`.
 pub fn single_chunk_patch(old: &[u8], new: &[u8], old_start: u64, instructions: &[u8]) -> Vec<u8> {
-    let _ = old;
     let compressed = zstd::bulk::compress(instructions, 3).unwrap();
     let mut p = Vec::new();
     p.extend_from_slice(&bidiff::MAGIC.to_le_bytes());
     p.extend_from_slice(&bidiff::VERSION.to_le_bytes());
+    p.extend_from_slice(&(old.len() as u64).to_le_bytes());
+    p.extend_from_slice(blake3::hash(old).as_bytes());
     p.extend_from_slice(&(new.len() as u64).to_le_bytes());
+    p.extend_from_slice(blake3::hash(new).as_bytes());
     p.extend_from_slice(&1u32.to_le_bytes());
     for v in [
         old_start,

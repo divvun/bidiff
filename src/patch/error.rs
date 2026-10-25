@@ -1,4 +1,5 @@
 use crate::{MAGIC, VERSION};
+use blake3::Hash;
 use std::{error::Error as StdError, fmt, io};
 
 /// Why a patch could not be read or applied.
@@ -11,6 +12,19 @@ pub enum Error {
     UnsupportedVersion(u32),
     /// The patch is truncated, inconsistent, or its instructions go out of range.
     Malformed(Malformed),
+    /// The base is not the file the patch was made from. Nothing was written.
+    ///
+    /// `actual_hash` is `None` when the size already differs and the base was
+    /// not hashed.
+    BaseMismatch {
+        expected_size: u64,
+        actual_size: u64,
+        expected_hash: Hash,
+        actual_hash: Option<Hash>,
+    },
+    /// The result does not have the hash the patch declares. When streaming,
+    /// all of it has already been written and must be discarded.
+    ResultMismatch { expected: Hash, actual: Hash },
     /// Writing the output failed, or the caller passed an output of the wrong size.
     Io(io::Error),
 }
@@ -66,6 +80,28 @@ impl fmt::Display for Error {
                 "unsupported patch format version {v:#X}; this library reads only {VERSION:#X}"
             ),
             Error::Malformed(m) => write!(f, "malformed patch: {m}"),
+            Error::BaseMismatch {
+                expected_size,
+                actual_size,
+                expected_hash,
+                actual_hash: None,
+            } => write!(
+                f,
+                "wrong base file: it is {actual_size} bytes, but the patch was made from \
+                 {expected_size} bytes with BLAKE3 {expected_hash}"
+            ),
+            Error::BaseMismatch {
+                expected_hash,
+                actual_hash: Some(actual),
+                ..
+            } => write!(
+                f,
+                "wrong base file: its BLAKE3 is {actual}, but the patch was made from {expected_hash}"
+            ),
+            Error::ResultMismatch { expected, actual } => write!(
+                f,
+                "patched result has BLAKE3 {actual}, but the patch declares {expected}"
+            ),
             Error::Io(_) => write!(f, "I/O error while applying patch"),
         }
     }

@@ -69,6 +69,7 @@ impl Sink for SliceSink<'_> {
 pub(crate) struct WriteSink<'w, W: Write + ?Sized> {
     out: &'w mut W,
     buf: Vec<u8>,
+    hasher: blake3::Hasher,
 }
 
 impl<'w, W: Write + ?Sized> WriteSink<'w, W> {
@@ -78,24 +79,30 @@ impl<'w, W: Write + ?Sized> WriteSink<'w, W> {
         Self {
             out,
             buf: Vec::with_capacity(cap),
+            hasher: blake3::Hasher::new(),
         }
     }
 
-    fn emit(out: &mut W, data: &[u8]) -> Result<(), Error> {
+    fn emit(out: &mut W, hasher: &mut blake3::Hasher, data: &[u8]) -> Result<(), Error> {
+        // Not update_rayon: called from outside the pool, each call waits on
+        // a worker handoff that costs more than it saves at this block size.
+        hasher.update(data);
         out.write_all(data).map_err(Error::Io)
     }
 
     fn flush_buf(&mut self) -> Result<(), Error> {
         if !self.buf.is_empty() {
-            Self::emit(self.out, &self.buf)?;
+            Self::emit(self.out, &mut self.hasher, &self.buf)?;
             self.buf.clear();
         }
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<(), Error> {
+    /// Flush everything and return the hash of all bytes written.
+    pub(crate) fn finish(mut self) -> Result<blake3::Hash, Error> {
         self.flush_buf()?;
-        self.out.flush().map_err(Error::Io)
+        self.out.flush().map_err(Error::Io)?;
+        Ok(self.hasher.finalize())
     }
 }
 
@@ -106,7 +113,7 @@ impl<W: Write + ?Sized> Sink for WriteSink<'_, W> {
             self.flush_buf()?;
         }
         if src.len() >= OUTPUT_BUF_LEN {
-            return Self::emit(self.out, src);
+            return Self::emit(self.out, &mut self.hasher, src);
         }
         self.buf.extend_from_slice(src);
         Ok(())

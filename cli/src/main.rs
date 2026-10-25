@@ -278,9 +278,10 @@ fn do_patch(
     let patch_data = mmap_file(patch)?;
     let patch = bidiff::patch::read_patch(&patch_data).context("read patch")?;
     let older = mmap_file(older)?;
+    let base = patch.verify_base(&older).context("check base file")?;
 
     write_output(output, patch.new_size(), |out| {
-        patch.apply_to_slice(&older, out).context("apply patch")
+        base.apply_to_slice(out).context("apply patch")
     })?;
 
     info!("Completed in {:?}", start.elapsed());

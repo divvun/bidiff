@@ -171,6 +171,7 @@ fn declared_instruction_length_is_enforced() {
     }
 }
 
+/// Apply a one-chunk patch whose result is declared to be `new_len` zeros.
 fn apply_raw(old: &[u8], new_len: usize, stream: &[u8]) -> Result<Vec<u8>, Error> {
     let patch = single_chunk_patch(old, &vec![0; new_len], 0, stream);
     apply_stream(old, &patch)
@@ -253,7 +254,8 @@ fn output_length_is_enforced() {
             ..
         }
     ));
-    assert_eq!(apply_raw(&old, 5, &lit).unwrap(), b"hello");
+    let patch = single_chunk_patch(&old, b"hello", 0, &lit);
+    assert_eq!(apply_stream(&old, &patch).unwrap(), b"hello");
 
     // A literal far longer than the stream must not be allocated or trusted.
     let huge = control(0, &[], u64::MAX - 1, b"x", 0);
@@ -324,11 +326,18 @@ fn bad_compressed_data() {
 }
 
 #[test]
-fn short_base_is_an_error() {
+fn instructions_are_checked_against_the_base_given() {
+    // apply_chunk skips the base check, so the instruction decoder alone
+    // must keep a short base from being read out of bounds.
     let (old, _, patch) = sample();
+    let p = read_patch(&patch).unwrap();
     for len in [0, 1, old.len() / 2, old.len() - 1] {
-        assert!(apply_stream(&old[..len], &patch).is_err());
-        assert!(apply_slice(&old[..len], &patch, u64::MAX).unwrap().is_err());
+        let mut failed = false;
+        for chunk in p.chunks() {
+            let mut out = vec![0; chunk.new_len() as usize];
+            failed |= apply_chunk(chunk, &old[..len], &mut out).is_err();
+        }
+        assert!(failed, "base of {len} bytes accepted by every chunk");
     }
 }
 
