@@ -236,3 +236,50 @@ fn version_0x2000_patches_are_refused() {
         Ok(_) => panic!("0x2000 patch accepted"),
     }
 }
+
+#[test]
+fn expected_result_is_accepted() {
+    let (old, new, patch) = sample();
+    let p = read_patch(&patch)
+        .unwrap()
+        .expect(new.len() as u64, blake3::hash(&new))
+        .unwrap();
+    let mut out = Recorder::default();
+    p.apply(&old, &mut out).unwrap();
+    assert_eq!(out.data, new);
+}
+
+#[test]
+fn unexpected_results_are_refused_before_any_work() {
+    let (_, new, mut patch) = sample();
+    // Damage every chunk's compressed data: had anything been decompressed,
+    // the error would be Malformed instead.
+    for chunk in chunk_offsets(&patch) {
+        let at = chunk + layout::CHUNK_META_LEN;
+        let len = get_u64(&patch, chunk + layout::DATA_LEN) as usize;
+        patch[at..at + len].fill(0xA5);
+    }
+    let size = new.len() as u64;
+    let hash = blake3::hash(&new);
+    let other = blake3::hash(b"something else");
+    for (expected_size, expected_hash) in [(size + 1, hash), (size, other), (0, other)] {
+        match read_patch(&patch)
+            .unwrap()
+            .expect(expected_size, expected_hash)
+        {
+            Err(Error::UnexpectedResult {
+                expected_size: es,
+                declared_size,
+                expected_hash: eh,
+                declared_hash,
+            }) => {
+                assert_eq!((es, eh), (expected_size, expected_hash));
+                assert_eq!((declared_size, declared_hash), (size, hash));
+            }
+            Err(e) => panic!("expected UnexpectedResult, got {e:?}"),
+            Ok(_) => panic!("unexpected result accepted"),
+        }
+    }
+    // The matching expectation passes; only applying finds the damage.
+    assert!(read_patch(&patch).unwrap().expect(size, hash).is_ok());
+}

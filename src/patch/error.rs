@@ -25,6 +25,14 @@ pub enum Error {
     /// The result does not have the hash the patch declares. When streaming,
     /// all of it has already been written and must be discarded.
     ResultMismatch { expected: Hash, actual: Hash },
+    /// The patch declares a different result than the caller expects, so it
+    /// was refused before any work. See [`PatchRef::expect`](super::PatchRef::expect).
+    UnexpectedResult {
+        expected_size: u64,
+        declared_size: u64,
+        expected_hash: Hash,
+        declared_hash: Hash,
+    },
     /// Writing the output failed, or the caller passed an output of the wrong size.
     Io(io::Error),
 }
@@ -105,6 +113,16 @@ impl fmt::Display for Error {
             Error::ResultMismatch { expected, actual } => write!(
                 f,
                 "patched result has BLAKE3 {actual}, but the patch declares {expected}"
+            ),
+            Error::UnexpectedResult {
+                expected_size,
+                declared_size,
+                expected_hash,
+                declared_hash,
+            } => write!(
+                f,
+                "patch produces {declared_size} bytes with BLAKE3 {declared_hash}, \
+                 but {expected_size} bytes with BLAKE3 {expected_hash} were expected"
             ),
             Error::Io(_) => write!(f, "I/O error while applying patch"),
         }

@@ -21,6 +21,9 @@ bidiff diff old_file new_file patch_file
 # Apply a patch
 bidiff patch old_file patch_file output_file
 
+# Apply it only if it produces the file you expect
+bidiff patch --expect-size 211200000 --expect-hash 36ace40e...ceb75 old_file patch_file output_file
+
 # Round-trip verification (diff then patch, verifies hash match)
 bidiff cycle old_file new_file
 

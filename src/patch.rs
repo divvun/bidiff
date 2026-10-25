@@ -240,6 +240,24 @@ impl<'a> PatchRef<'a> {
         &self.chunks
     }
 
+    /// Refuse the patch unless it declares a result of `new_size` bytes with
+    /// BLAKE3 `new_hash`, such as a size and hash attested elsewhere.
+    ///
+    /// This compares header fields only, so a patch for some other result is
+    /// turned away before its base is hashed or any chunk is decompressed.
+    pub fn expect(self, new_size: u64, new_hash: Hash) -> Result<Self, Error> {
+        if self.new_size == new_size && self.new_hash == new_hash {
+            Ok(self)
+        } else {
+            Err(Error::UnexpectedResult {
+                expected_size: new_size,
+                declared_size: self.new_size,
+                expected_hash: new_hash,
+                declared_hash: self.new_hash,
+            })
+        }
+    }
+
     /// Check that `old` is the base this patch was made from: its size first,
     /// then its BLAKE3 hash.
     pub fn verify_base<'s>(&'s self, old: &'s [u8]) -> Result<VerifiedBase<'s, 'a>, Error> {

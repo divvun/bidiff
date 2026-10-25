@@ -60,6 +60,16 @@ struct Patch {
     older: PathBuf,
     patch: PathBuf,
     output: PathBuf,
+    /// Refuse the patch unless its result is this many bytes
+    #[arg(long)]
+    expect_size: Option<u64>,
+    /// Refuse the patch unless its result has this BLAKE3 hash (hex, as b3sum prints)
+    #[arg(long, value_parser = parse_hash)]
+    expect_hash: Option<blake3::Hash>,
+}
+
+fn parse_hash(s: &str) -> Result<blake3::Hash, blake3::HexError> {
+    blake3::Hash::from_hex(s)
 }
 
 #[derive(Parser, Debug)]
@@ -241,17 +251,19 @@ fn do_cycle(
 
     let compatch_size = std::fs::metadata(&patch_path)?.len();
 
+    let newer_hash = blake3::hash(&newer_mmap[..]);
     let before_patch = Instant::now();
     do_patch(&Patch {
         older: older.clone(),
         patch: patch_path,
         output: output_path.clone(),
+        expect_size: Some(newer_mmap.len() as u64),
+        expect_hash: Some(newer_hash),
     })?;
     let patch_duration = before_patch.elapsed();
 
     let fresh = mmap_file(&output_path)?;
     anyhow::ensure!(fresh.len() == newer_mmap.len(), "Size mismatch!");
-    let newer_hash = blake3::hash(&newer_mmap[..]);
     let fresh_hash = blake3::hash(&fresh[..]);
     anyhow::ensure!(newer_hash == fresh_hash, "Hash mismatch!");
 
@@ -282,12 +294,17 @@ fn do_patch(
         older,
         patch,
         output,
+        expect_size,
+        expect_hash,
     }: &Patch,
 ) -> Result<()> {
     let start = Instant::now();
 
     let patch_data = mmap_file(patch)?;
     let patch = bidiff::patch::read_patch(&patch_data).context("read patch")?;
+    let size = expect_size.unwrap_or(patch.new_size());
+    let hash = expect_hash.unwrap_or(patch.new_hash());
+    let patch = patch.expect(size, hash).context("check expected result")?;
     let older = mmap_file(older)?;
     let base = patch.verify_base(&older).context("check base file")?;
 
