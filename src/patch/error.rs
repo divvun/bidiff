@@ -48,6 +48,10 @@ pub enum Malformed {
     TrailingData { offset: usize },
     /// The chunk's data is not exactly one valid zstd frame.
     Compression { chunk: usize, source: io::Error },
+    /// The chunk's zstd frame asks for a larger window than the format
+    /// allows, [`MAX_WINDOW_LOG`](super::MAX_WINDOW_LOG). Nothing was
+    /// allocated for it.
+    WindowTooLarge { chunk: usize, window: u64 },
     /// The instruction stream ends inside an instruction, or a varint is over-long.
     Instruction { chunk: usize, offset: u64 },
     /// An instruction reads or seeks outside the base.
@@ -130,6 +134,11 @@ impl fmt::Display for Malformed {
             Malformed::Compression { chunk, source } => {
                 write!(f, "chunk {chunk} has bad compressed data: {source}")
             }
+            Malformed::WindowTooLarge { chunk, window } => write!(
+                f,
+                "chunk {chunk} needs a {window}-byte zstd window; the format allows {}",
+                1u64 << super::MAX_WINDOW_LOG
+            ),
             Malformed::Instruction { chunk, offset } => write!(
                 f,
                 "chunk {chunk} has a truncated or invalid instruction at offset {offset}"

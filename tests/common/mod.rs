@@ -162,6 +162,45 @@ pub fn single_chunk_patch(old: &[u8], new: &[u8], old_start: u64, instructions: 
     p
 }
 
+/// A one-chunk patch whose chunk data is `frame`, taken as is.
+pub fn single_frame_patch(old: &[u8], new: &[u8], raw_len: u64, frame: &[u8]) -> Vec<u8> {
+    let mut p = single_chunk_patch(old, new, 0, &[]);
+    let meta = layout::HEADER_LEN;
+    p.truncate(meta + layout::CHUNK_META_LEN);
+    put_u64(&mut p, meta + layout::RAW_LEN, raw_len);
+    put_u64(&mut p, meta + layout::DATA_LEN, frame.len() as u64);
+    p.extend_from_slice(frame);
+    p
+}
+
+/// A zstd frame declaring a window of `2^window_log` bytes plus `mantissa`
+/// eighths, holding `payload` in one raw block.
+pub fn raw_frame(window_log: u32, mantissa: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    f.push(0);
+    f.push(((window_log - 10) << 3) as u8 | mantissa);
+    let block_header = (payload.len() as u32) << 3 | 1;
+    f.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    f.extend_from_slice(payload);
+    f
+}
+
+/// The window a zstd frame header declares (RFC 8878, 3.1.1.1).
+pub fn frame_window(f: &[u8]) -> u64 {
+    let descriptor = f[4];
+    if descriptor & 0x20 == 0 {
+        let base = 1u64 << (10 + (f[5] >> 3));
+        return base + base / 8 * u64::from(f[5] & 7);
+    }
+    let at = 5 + [0, 1, 2, 4][usize::from(descriptor & 3)];
+    match descriptor >> 6 {
+        0 => u64::from(f[at]),
+        1 => u64::from(u16::from_le_bytes([f[at], f[at + 1]])) + 256,
+        2 => u64::from(get_u32(f, at)),
+        _ => get_u64(f, at),
+    }
+}
+
 pub fn varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push(v as u8 | 0x80);

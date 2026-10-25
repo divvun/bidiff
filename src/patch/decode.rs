@@ -1,21 +1,33 @@
-use super::{ChunkRef, Error, Malformed};
+use super::{ChunkRef, Error, MAX_WINDOW_LOG, Malformed, frame};
 use std::io::{self, ErrorKind, Write};
-use zstd::stream::raw::{DParameter, Decoder, Operation};
-
-/// zstd's default limit, and the largest window level 22 asks for. It bounds
-/// what a hostile frame header can make the decoder allocate.
-const WINDOW_LOG_MAX: u32 = 27;
+use zstd::zstd_safe::{self, DCtx, DParameter, InBuffer, OutBuffer, ResetDirective};
 
 pub(crate) const INSTRUCTION_BUF_LEN: usize = 128 * 1024;
+
+/// What one decoder and its instruction buffer hold beyond the window: zstd's
+/// context and block buffers, which tests::decoder_memory measures at about
+/// half this.
+#[cfg(any(feature = "rayon", test))]
+pub(crate) const DECODER_OVERHEAD: usize = 1 << 20;
 
 const OUTPUT_BUF_LEN: usize = 1024 * 1024;
 
 const MAX_VARINT_LEN: usize = 10;
 
-pub(crate) fn decoder() -> Result<Decoder<'static>, Error> {
-    let mut d = Decoder::new().map_err(Error::Io)?;
-    d.set_parameter(DParameter::WindowLogMax(WINDOW_LOG_MAX))
-        .map_err(Error::Io)?;
+fn zstd_error(code: zstd_safe::ErrorCode) -> io::Error {
+    io::Error::other(zstd_safe::get_error_name(code))
+}
+
+/// A zstd decoder that refuses frames needing more than the format's window.
+pub(crate) fn decoder() -> Result<DCtx<'static>, Error> {
+    let mut d = DCtx::try_create().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            ErrorKind::OutOfMemory,
+            "cannot allocate a zstd decoder",
+        ))
+    })?;
+    d.set_parameter(DParameter::WindowLogMax(MAX_WINDOW_LOG))
+        .map_err(|c| Error::Io(zstd_error(c)))?;
     Ok(d)
 }
 
@@ -141,9 +153,9 @@ impl<W: Write + ?Sized> Sink for WriteSink<'_, W> {
 
 /// A window over a chunk's instruction stream, decompressed on demand so
 /// memory stays bounded whatever lengths the patch declares.
-struct Instructions<'c, 'd> {
+pub(crate) struct Instructions<'c, 'd> {
     chunk: usize,
-    dec: &'d mut Decoder<'static>,
+    dec: &'d mut DCtx<'static>,
     input: &'c [u8],
     buf: &'d mut [u8],
     start: usize,
@@ -155,7 +167,22 @@ struct Instructions<'c, 'd> {
     frame_done: bool,
 }
 
-impl Instructions<'_, '_> {
+impl<'c, 'd> Instructions<'c, 'd> {
+    pub(crate) fn new(chunk: &ChunkRef<'c>, dec: &'d mut DCtx<'static>, buf: &'d mut [u8]) -> Self {
+        Self {
+            chunk: chunk.index,
+            dec,
+            input: chunk.data,
+            buf,
+            start: 0,
+            end: 0,
+            pos: 0,
+            produced: 0,
+            raw_len: chunk.raw_len,
+            frame_done: false,
+        }
+    }
+
     #[inline]
     fn available(&self) -> usize {
         self.end - self.start
@@ -192,13 +219,14 @@ impl Instructions<'_, '_> {
         self.end -= self.start;
         self.start = 0;
         while self.end < want && !self.frame_done {
-            let status = self
-                .dec
-                .run_on_buffers(self.input, &mut self.buf[self.end..])
-                .map_err(|e| self.compression(e))?;
-            self.input = &self.input[status.bytes_read..];
-            self.end += status.bytes_written;
-            self.produced += status.bytes_written as u64;
+            let mut input = InBuffer::around(self.input);
+            let mut output = OutBuffer::around(&mut self.buf[self.end..]);
+            let status = self.dec.decompress_stream(&mut output, &mut input);
+            let (read, written) = (input.pos(), output.pos());
+            let remaining = status.map_err(|c| self.compression(zstd_error(c)))?;
+            self.input = &self.input[read..];
+            self.end += written;
+            self.produced += written as u64;
             if self.produced > self.raw_len {
                 return Err(Malformed::InstructionLength {
                     chunk: self.chunk,
@@ -207,9 +235,9 @@ impl Instructions<'_, '_> {
                 }
                 .into());
             }
-            if status.remaining == 0 {
+            if remaining == 0 {
                 self.frame_done = true;
-            } else if status.bytes_read == 0 && status.bytes_written == 0 {
+            } else if read == 0 && written == 0 {
                 return Err(self.compression(io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "zstd frame is truncated",
@@ -251,7 +279,7 @@ impl Instructions<'_, '_> {
 
     /// Feed the next `n` stream bytes to `f`, in pieces.
     #[inline]
-    fn take(
+    pub(crate) fn take(
         &mut self,
         mut n: u64,
         mut f: impl FnMut(&[u8]) -> Result<(), Error>,
@@ -282,27 +310,27 @@ fn zigzag(v: u64) -> i64 {
 pub(crate) fn run_chunk<S: Sink>(
     chunk: &ChunkRef<'_>,
     old: &[u8],
-    dec: &mut Decoder<'static>,
+    dec: &mut DCtx<'static>,
     buf: &mut [u8],
     sink: &mut S,
 ) -> Result<(), Error> {
     let index = chunk.index;
-    dec.reinit().map_err(|source| Malformed::Compression {
-        chunk: index,
-        source,
-    })?;
-    let mut r = Instructions {
-        chunk: index,
-        dec,
-        input: chunk.data,
-        buf,
-        start: 0,
-        end: 0,
-        pos: 0,
-        produced: 0,
-        raw_len: chunk.raw_len,
-        frame_done: false,
-    };
+    // zstd would refuse this too, but checking first gives a precise error.
+    if let Some(window) = frame::window_size(chunk.data)
+        && window > 1 << MAX_WINDOW_LOG
+    {
+        return Err(Malformed::WindowTooLarge {
+            chunk: index,
+            window,
+        }
+        .into());
+    }
+    dec.reset(ResetDirective::SessionOnly)
+        .map_err(|c| Malformed::Compression {
+            chunk: index,
+            source: zstd_error(c),
+        })?;
+    let mut r = Instructions::new(chunk, dec, buf);
 
     let old_len = old.len() as u64;
     let new_len = chunk.new_len;
@@ -427,6 +455,51 @@ mod tests {
             frame_done: false,
         };
         r.varint()
+    }
+
+    /// Stream `frame` through `dec`, returning whether it decoded.
+    fn stream(dec: &mut DCtx<'static>, frame: &[u8]) -> bool {
+        let mut input = InBuffer::around(frame);
+        let mut buf = vec![0; 1 << 16];
+        loop {
+            let mut output = OutBuffer::around(&mut buf[..]);
+            match dec.decompress_stream(&mut output, &mut input) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_memory() {
+        let largest = frame::raw_frame(MAX_WINDOW_LOG, 0, b"payload");
+        let mut dec = decoder().unwrap();
+        assert!(stream(&mut dec, &largest));
+        let used = dec.sizeof();
+        assert!(used >= 1 << MAX_WINDOW_LOG, "window not allocated: {used}");
+        assert!(
+            used + INSTRUCTION_BUF_LEN <= (1 << MAX_WINDOW_LOG) + DECODER_OVERHEAD,
+            "decoder holds {used} bytes"
+        );
+
+        let hostile = frame::raw_frame(27, 0, b"payload");
+        let mut dec = decoder().unwrap();
+        let before = dec.sizeof();
+        assert!(!stream(&mut dec, &hostile));
+        assert!(
+            dec.sizeof() <= before + (64 << 10),
+            "refusal allocated {}",
+            dec.sizeof()
+        );
+
+        // zstd's default limit takes the same frame and allocates its window.
+        let mut permissive = DCtx::create();
+        permissive
+            .set_parameter(DParameter::WindowLogMax(27))
+            .unwrap();
+        assert!(stream(&mut permissive, &hostile));
+        assert!(permissive.sizeof() > 1 << 27);
     }
 
     #[test]

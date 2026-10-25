@@ -28,6 +28,9 @@
 //! | 8          | `data_len`                                             |
 //! | `data_len` | one zstd frame holding the instruction stream          |
 //!
+//! A frame may not ask for a window larger than 2^[`MAX_WINDOW_LOG`] bytes;
+//! the encoder caps its window to fit and the decoder refuses larger ones.
+//!
 //! Chunks are stored in output order and cover `0..new_size` exactly once,
 //! so they can be applied in parallel to disjoint parts of the output.
 //!
@@ -49,11 +52,19 @@ use std::io::{self, ErrorKind, Write};
 
 mod decode;
 mod error;
+mod frame;
 
 pub use blake3::Hash;
 pub use error::{Error, Malformed};
 
 const CHUNK_META_LEN: usize = 40;
+
+/// Largest zstd window, as a power of two, a chunk's frame may ask for.
+/// It bounds what one decoder allocates, whatever the patch says.
+///
+/// 8 MiB is the largest window zstd's levels 1 to 19 use, so only levels 20
+/// to 22 on chunks over 8 MiB are capped.
+pub const MAX_WINDOW_LOG: u32 = 23;
 
 /// A parsed patch whose chunks are known to tile the output.
 ///
@@ -307,21 +318,7 @@ impl VerifiedBase<'_, '_> {
         }
 
         #[cfg(feature = "rayon")]
-        {
-            use rayon::prelude::*;
-            regions.into_par_iter().try_for_each_init(
-                || None,
-                |state, (chunk, region)| {
-                    let (dec, buf) = match state {
-                        Some(s) => s,
-                        None => {
-                            state.insert((decode::decoder()?, vec![0; decode::INSTRUCTION_BUF_LEN]))
-                        }
-                    };
-                    decode::run_chunk(chunk, old, dec, buf, &mut decode::SliceSink::new(region))
-                },
-            )?;
-        }
+        decode_in_parallel(regions, old)?;
         #[cfg(not(feature = "rayon"))]
         {
             let mut dec = decode::decoder()?;
@@ -334,6 +331,55 @@ impl VerifiedBase<'_, '_> {
 
         patch.check_result(hash(out))
     }
+}
+
+/// Decoder memory the parallel path may hold at once. Every worker's decoder
+/// can grow to the largest window the patch declares plus
+/// [`decode::DECODER_OVERHEAD`], so this, not the thread count, bounds the
+/// worst case.
+#[cfg(feature = "rayon")]
+const PARALLEL_DECODE_BUDGET: usize = 128 << 20;
+
+/// Apply each chunk into its region with a fixed set of workers pulling from
+/// one queue, so decoders are allocated once per worker and their number is
+/// bounded by [`PARALLEL_DECODE_BUDGET`].
+#[cfg(feature = "rayon")]
+fn decode_in_parallel(regions: Vec<(&ChunkRef<'_>, &mut [u8])>, old: &[u8]) -> Result<(), Error> {
+    use rayon::prelude::*;
+    use std::sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    // Frames asking for more than MAX_WINDOW_LOG are refused before decoding.
+    let window = regions
+        .iter()
+        .filter_map(|(chunk, _)| frame::window_size(chunk.data))
+        .max()
+        .unwrap_or(0)
+        .min(1 << MAX_WINDOW_LOG) as usize;
+    let workers = rayon::current_num_threads()
+        .min(PARALLEL_DECODE_BUDGET / (window + decode::DECODER_OVERHEAD))
+        .min(regions.len())
+        .max(1);
+    let queue = Mutex::new(regions.into_iter());
+    let failed = AtomicBool::new(false);
+    (0..workers).into_par_iter().try_for_each(|_| {
+        let mut dec = decode::decoder()?;
+        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+        while !failed.load(Ordering::Relaxed) {
+            let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+            let Some((chunk, region)) = next else {
+                break;
+            };
+            let mut sink = decode::SliceSink::new(region);
+            if let Err(e) = decode::run_chunk(chunk, old, &mut dec, &mut buf, &mut sink) {
+                failed.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+        Ok(())
+    })
 }
 
 impl PatchRef<'_> {
@@ -407,6 +453,22 @@ pub(crate) fn write_header(
     out.write_all(&num_chunks.to_le_bytes())
 }
 
+/// Compress a chunk's instruction stream into one frame whose window fits
+/// [`MAX_WINDOW_LOG`].
+///
+/// zstd already shrinks the window to fit small inputs, so only levels whose
+/// default window exceeds the cap are recompressed; capping never raises it.
+#[cfg(feature = "diff")]
+pub(crate) fn compress_chunk(raw: &[u8], level: i32) -> io::Result<Vec<u8>> {
+    let mut compressor = zstd::bulk::Compressor::new(level)?;
+    let compressed = compressor.compress(raw)?;
+    if frame::window_size(&compressed).is_some_and(|w| w > 1 << MAX_WINDOW_LOG) {
+        compressor.set_parameter(zstd::zstd_safe::CParameter::WindowLog(MAX_WINDOW_LOG))?;
+        return compressor.compress(raw);
+    }
+    Ok(compressed)
+}
+
 #[cfg(feature = "diff")]
 pub(crate) fn write_chunk(
     out: &mut dyn Write,
@@ -420,4 +482,51 @@ pub(crate) fn write_chunk(
         out.write_all(&v.to_le_bytes())?;
     }
     out.write_all(data)
+}
+
+#[cfg(all(test, feature = "diff"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compress_chunk_caps_the_window() {
+        // Sparse bytes over zeros, longer than the cap, so level 22 would
+        // otherwise pick a larger window.
+        let mut raw = vec![0u8; (1 << MAX_WINDOW_LOG) + (1 << 20)];
+        let mut x = 1u32;
+        for b in raw.iter_mut().step_by(61) {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (x >> 24) as u8;
+        }
+        let uncapped = zstd::bulk::compress(&raw, 22).unwrap();
+        assert!(frame::window_size(&uncapped).unwrap() > 1 << MAX_WINDOW_LOG);
+
+        let capped = compress_chunk(&raw, 22).unwrap();
+        assert_eq!(frame::window_size(&capped), Some(1 << MAX_WINDOW_LOG));
+        let chunk = ChunkRef {
+            index: 0,
+            old_start: 0,
+            new_start: 0,
+            new_len: raw.len() as u64,
+            raw_len: raw.len() as u64,
+            data: &capped,
+        };
+        let mut dec = decode::decoder().unwrap();
+        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+        let mut r = decode::Instructions::new(&chunk, &mut dec, &mut buf);
+        let mut out = Vec::new();
+        r.take(raw.len() as u64, |piece| {
+            out.extend_from_slice(piece);
+            Ok(())
+        })
+        .unwrap();
+        assert!(out == raw);
+
+        // Below the cap, a level's own choice stands.
+        let small = &raw[..1 << 20];
+        assert_eq!(
+            compress_chunk(small, 3).unwrap(),
+            zstd::bulk::compress(small, 3).unwrap()
+        );
+    }
 }

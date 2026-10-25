@@ -730,8 +730,7 @@ pub fn simple_diff_chunked_with_params(
 
             // Compress sub-patch independently
             let raw_len = sub_patch.len() as u64;
-            let compressed =
-                zstd::bulk::compress(&sub_patch, zstd_level).map_err(io::Error::other)?;
+            let compressed = patch::compress_chunk(&sub_patch, zstd_level)?;
 
             patch::write_chunk(
                 out,

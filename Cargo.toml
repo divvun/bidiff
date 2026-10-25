@@ -33,6 +33,10 @@ blake3 = "1.8"
 [workspace]
 members = ["cli"]
 
+# zstd's C code at -O0 makes the level-22 tests take minutes.
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
 [profile.release]
 debug = true
 lto = "fat"
