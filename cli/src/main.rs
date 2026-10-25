@@ -107,7 +107,7 @@ fn read_rss_anon() -> u64 {
 fn read_rss_anon() -> u64 {
     use mach_sys::kern_return::KERN_SUCCESS;
     use mach_sys::task::task_info;
-    use mach_sys::task_info::{task_vm_info_t, TASK_VM_INFO, TASK_VM_INFO_COUNT};
+    use mach_sys::task_info::{TASK_VM_INFO, TASK_VM_INFO_COUNT, task_vm_info_t};
     use mach_sys::traps::mach_task_self;
     use std::mem::MaybeUninit;
     unsafe {
