@@ -1,0 +1,25 @@
+[package]
+name = "bidiff-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blake3 = "1.8"
+
+[dependencies.bidiff]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "apply"
+path = "fuzz_targets/apply.rs"
+test = false
+doc = false
+bench = false

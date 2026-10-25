@@ -7,6 +7,7 @@
 
 mod common;
 
+use bidiff::patch::{apply_chunk, read_patch};
 use common::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -202,6 +203,16 @@ fn mutated_patches_never_panic() {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let streamed = apply_stream_capped(old, &mutant, OUTPUT_CAP);
             let sliced = apply_slice(old, &mutant, OUTPUT_CAP as u64);
+            // apply_chunk skips the base check, so the decoder also meets
+            // bases the patch was not made for.
+            if let Ok(p) = read_patch(&mutant) {
+                for chunk in p.chunks() {
+                    if chunk.new_len() <= OUTPUT_CAP as u64 {
+                        let mut out = vec![0; chunk.new_len() as usize];
+                        let _ = apply_chunk(chunk, old, &mut out);
+                    }
+                }
+            }
             (streamed, sliced)
         }));
         let Ok((streamed, sliced)) = outcome else {
