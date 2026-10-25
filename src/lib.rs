@@ -678,17 +678,20 @@ pub fn simple_diff_chunked_with_params(
     zstd_level: i32,
 ) -> Result<(), io::Error> {
     let chunk_size = diff_params.scan_chunk_size.unwrap_or(newer.len().max(1));
-    let num_chunks = if newer.is_empty() {
-        1
-    } else {
-        newer.len().div_ceil(chunk_size)
+    // Must match how many times diff_chunked calls back: once per scan chunk,
+    // or exactly once when unchunked, even for an empty `newer`.
+    let num_chunks = match diff_params.scan_chunk_size {
+        Some(size) => newer.len().div_ceil(size),
+        None => 1,
     };
+    let num_chunks = u32::try_from(num_chunks).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "more than u32::MAX chunks; use a larger scan chunk size",
+        )
+    })?;
 
-    // Write header
-    out.write_all(&MAGIC.to_le_bytes())?;
-    out.write_all(&VERSION.to_le_bytes())?;
-    out.write_all(&(newer.len() as u64).to_le_bytes())?;
-    out.write_all(&(num_chunks as u32).to_le_bytes())?;
+    patch::write_header(out, newer.len() as u64, num_chunks)?;
 
     diff_chunked(
         older,
@@ -724,15 +727,14 @@ pub fn simple_diff_chunked_with_params(
             let compressed =
                 zstd::bulk::compress(&sub_patch, zstd_level).map_err(io::Error::other)?;
 
-            // Write chunk metadata + compressed data
-            out.write_all(&first_old_start.to_le_bytes())?;
-            out.write_all(&(new_start as u64).to_le_bytes())?;
-            out.write_all(&(new_len as u64).to_le_bytes())?;
-            out.write_all(&raw_len.to_le_bytes())?;
-            out.write_all(&(compressed.len() as u64).to_le_bytes())?;
-            out.write_all(&compressed)?;
-
-            Ok::<(), io::Error>(())
+            patch::write_chunk(
+                out,
+                first_old_start,
+                new_start as u64,
+                new_len as u64,
+                raw_len,
+                &compressed,
+            )
         },
     )?;
 

@@ -275,64 +275,59 @@ fn do_patch(
 ) -> Result<()> {
     let start = Instant::now();
 
-    // Mmap patch file directly — each chunk is independently compressed inside
     let patch_data = mmap_file(patch)?;
-
-    // Parse chunked patch header (zero-copy: borrows slices from patch_data)
-    let header = bidiff::patch::read_patch(&patch_data).context("read chunked patch header")?;
+    let patch = bidiff::patch::read_patch(&patch_data).context("read patch")?;
     let older = mmap_file(older)?;
 
-    // Setup output mmap with fallocate + huge pages
+    write_output(output, patch.new_size(), |out| {
+        patch.apply_to_slice(&older, out).context("apply patch")
+    })?;
+
+    info!("Completed in {:?}", start.elapsed());
+
+    Ok(())
+}
+
+/// Create `path` as a `size`-byte mmap and fill it with `fill`. The file is
+/// removed if `fill` fails, so a bad patch leaves no plausible-looking output.
+fn write_output(
+    path: &PathBuf,
+    size: u64,
+    fill: impl FnOnce(&mut [u8]) -> Result<()>,
+) -> Result<()> {
     let output_file = File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(output)
+        .open(path)
         .context("create output file")?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        // fallocate pre-allocates disk blocks, avoiding per-page block allocation during writes.
-        // Falls back to ftruncate on failure (e.g. tmpfs).
-        if unsafe { libc::fallocate(output_file.as_raw_fd(), 0, 0, header.new_size as i64) } != 0 {
-            output_file
-                .set_len(header.new_size)
-                .context("pre-size output file")?;
+    let result = (|| {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // fallocate pre-allocates disk blocks, avoiding per-page block allocation during writes.
+            // Falls back to ftruncate on failure (e.g. tmpfs).
+            let len = i64::try_from(size).context("output size")?;
+            if unsafe { libc::fallocate(output_file.as_raw_fd(), 0, 0, len) } != 0 {
+                output_file.set_len(size).context("pre-size output file")?;
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        output_file.set_len(size).context("pre-size output file")?;
+        let mut output_mmap =
+            unsafe { memmap2::MmapMut::map_mut(&output_file) }.context("mmap output file")?;
+        #[cfg(target_os = "linux")]
+        output_mmap.advise(memmap2::Advice::HugePage).ok();
+
+        fill(&mut output_mmap)?;
+        output_mmap.flush_async().context("flush output mmap")
+    })();
+    if result.is_err() {
+        drop(output_file);
+        std::fs::remove_file(path).ok();
     }
-    #[cfg(not(target_os = "linux"))]
-    output_file
-        .set_len(header.new_size)
-        .context("pre-size output file")?;
-    let mut output_mmap =
-        unsafe { memmap2::MmapMut::map_mut(&output_file) }.context("mmap output file")?;
-    #[cfg(target_os = "linux")]
-    output_mmap.advise(memmap2::Advice::HugePage).ok();
-
-    // Apply chunks in parallel using rayon's thread pool for bounded parallelism.
-    let out = output_mmap.as_mut_ptr() as usize;
-    let out_len = output_mmap.len();
-    rayon::scope(|s| {
-        for chunk in &header.chunks {
-            let start = chunk.new_start as usize;
-            let len = chunk.new_len as usize;
-            assert!(start + len <= out_len);
-            // SAFETY: each chunk writes to a non-overlapping region of the mmap.
-            let output_slice =
-                unsafe { std::slice::from_raw_parts_mut((out + start) as *mut u8, len) };
-            let old_ref = &older[..];
-            s.spawn(move |_| {
-                bidiff::patch::apply_chunk(chunk, old_ref, output_slice).unwrap();
-            });
-        }
-    });
-
-    output_mmap.flush_async().context("flush output mmap")?;
-
-    info!("Completed in {:?}", start.elapsed());
-
-    Ok(())
+    result
 }
 
 fn mmap_file(path: &PathBuf) -> Result<Mmap> {

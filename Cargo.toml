@@ -11,6 +11,7 @@ repository = "https://github.com/divvun/bidiff"
 default = ["diff", "patch"]
 diff = ["rayon", "ringbuf", "memmap2", "tempfile"]
 patch = ["integer-encoding", "zstd"]
+rayon = ["dep:rayon"]
 instructions = []
 profiling = []
 
@@ -25,6 +26,7 @@ tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+zstd = "0.13"
 
 [workspace]
 members = ["cli"]

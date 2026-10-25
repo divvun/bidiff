@@ -21,7 +21,6 @@ clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 mimalloc = "0.1"
 anyhow = "1"
-rayon = "1.11"
 
 libc = "0.2"
 tempfile = "3"

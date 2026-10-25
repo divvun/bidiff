@@ -1,207 +1,301 @@
+//! Reading and applying patches.
+//!
+//! # Format
+//!
+//! Integers are little-endian. A patch is a header followed by `num_chunks`
+//! chunks:
+//!
+//! | Offset | Size | Field                                   |
+//! |--------|------|-----------------------------------------|
+//! | 0      | 4    | magic, [`MAGIC`]                        |
+//! | 4      | 4    | format version, [`VERSION`]             |
+//! | 8      | 8    | `new_size`: length of the result        |
+//! | 16     | 4    | `num_chunks`                            |
+//!
+//! Each chunk is 40 bytes of metadata followed by its data:
+//!
+//! | Size       | Field                                                  |
+//! |------------|--------------------------------------------------------|
+//! | 8          | `old_start`: base offset the first instruction reads   |
+//! | 8          | `new_start`: result offset of the chunk's first byte   |
+//! | 8          | `new_len`: bytes the chunk produces                    |
+//! | 8          | `raw_len`: decompressed length of the instructions     |
+//! | 8          | `data_len`                                             |
+//! | `data_len` | one zstd frame holding the instruction stream          |
+//!
+//! Chunks are stored in output order and cover `0..new_size` exactly once,
+//! so they can be applied in parallel to disjoint parts of the output.
+//!
+//! An instruction stream is a sequence of controls. Each control is:
+//!
+//! - `add_tag`, a varint. `add_tag >> 1` bytes are taken from the base at the
+//!   base cursor, which then advances by that much. If the low bit is 0, as
+//!   many delta bytes follow and each is added (wrapping) to its base byte; if
+//!   1, the base bytes are output unchanged.
+//! - `copy_tag`, a varint. If the low bit is 0, `copy_tag >> 1` literal bytes
+//!   follow. If 1, a varint base offset follows and `copy_tag >> 1` bytes are
+//!   copied from there; the base cursor does not move.
+//! - `seek`, a zigzag varint added to the base cursor.
+//!
+//! Varints are unsigned LEB128 of at most 10 bytes.
+
 use super::{MAGIC, VERSION};
-use integer_encoding::VarInt;
-use std::{
-    error::Error as StdError,
-    fmt,
-    io::{self, ErrorKind},
-};
+use std::io::{self, ErrorKind, Write};
 
-#[derive(Debug)]
-pub enum DecodeError {
-    IO(io::Error),
-    WrongMagic(u32),
-    WrongVersion(u32),
-}
+mod decode;
+mod error;
 
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            DecodeError::IO(_) => write!(f, "I/O error"),
-            DecodeError::WrongMagic(e) => {
-                write!(f, "wrong magic: expected `{:X}`, got `{:X}`", MAGIC, e)
-            }
-            DecodeError::WrongVersion(e) => {
-                write!(f, "wrong version: expected `{:X}`, got `{:X}`", VERSION, e)
-            }
-        }
-    }
-}
+pub use error::{Error, Malformed};
 
-impl StdError for DecodeError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            DecodeError::IO(e) => Some(e),
-            DecodeError::WrongMagic { .. } => None,
-            DecodeError::WrongVersion { .. } => None,
-        }
-    }
-}
+const CHUNK_META_LEN: usize = 40;
 
-impl From<io::Error> for DecodeError {
-    fn from(source: io::Error) -> Self {
-        DecodeError::IO(source)
-    }
-}
-
-// --- Chunked patch format (zero-copy) ---
-
+/// A parsed patch whose chunks are known to tile the output.
+///
+/// Chunk data is borrowed from the patch bytes.
 pub struct PatchRef<'a> {
-    pub new_size: u64,
-    pub chunks: Vec<ChunkRef<'a>>,
+    new_size: u64,
+    chunks: Vec<ChunkRef<'a>>,
 }
 
+/// One independently compressed piece of a patch.
 pub struct ChunkRef<'a> {
-    pub old_start: u64,
-    pub new_start: u64,
-    pub new_len: u64,
-    pub raw_len: u64,
-    pub data: &'a [u8],
+    index: usize,
+    old_start: u64,
+    new_start: u64,
+    new_len: u64,
+    raw_len: u64,
+    data: &'a [u8],
 }
 
-fn get_u32_le(data: &[u8], off: &mut usize) -> Result<u32, DecodeError> {
-    let end = *off + 4;
-    if end > data.len() {
-        return Err(DecodeError::IO(io::Error::new(
-            ErrorKind::UnexpectedEof,
-            "truncated patch",
-        )));
+impl ChunkRef<'_> {
+    /// Position of this chunk in the patch.
+    pub fn index(&self) -> usize {
+        self.index
     }
-    let v = u32::from_le_bytes(data[*off..end].try_into().unwrap());
-    *off = end;
-    Ok(v)
+
+    pub fn old_start(&self) -> u64 {
+        self.old_start
+    }
+
+    /// Offset in the result where this chunk's output starts.
+    pub fn new_start(&self) -> u64 {
+        self.new_start
+    }
+
+    /// Bytes this chunk produces.
+    pub fn new_len(&self) -> u64 {
+        self.new_len
+    }
 }
 
-fn get_u64_le(data: &[u8], off: &mut usize) -> Result<u64, DecodeError> {
-    let end = *off + 8;
-    if end > data.len() {
-        return Err(DecodeError::IO(io::Error::new(
-            ErrorKind::UnexpectedEof,
-            "truncated patch",
-        )));
-    }
-    let v = u64::from_le_bytes(data[*off..end].try_into().unwrap());
-    *off = end;
-    Ok(v)
+struct Cursor<'a> {
+    data: &'a [u8],
+    off: usize,
 }
 
-/// Read a chunked patch from a byte slice, zero-copy: chunk data is borrowed from the input.
-pub fn read_patch(data: &[u8]) -> Result<PatchRef<'_>, DecodeError> {
-    let mut off = 0;
-    let magic = get_u32_le(data, &mut off)?;
-    if magic != MAGIC {
-        return Err(DecodeError::WrongMagic(magic));
+impl<'a> Cursor<'a> {
+    fn remaining(&self) -> usize {
+        self.data.len() - self.off
     }
-    let version = get_u32_le(data, &mut off)?;
-    if version != VERSION {
-        return Err(DecodeError::WrongVersion(version));
-    }
-    let new_size = get_u64_le(data, &mut off)?;
-    let num_chunks = get_u32_le(data, &mut off)? as usize;
 
-    let mut chunks = Vec::with_capacity(num_chunks);
-    for _ in 0..num_chunks {
-        let old_start = get_u64_le(data, &mut off)?;
-        let new_start = get_u64_le(data, &mut off)?;
-        let new_len = get_u64_le(data, &mut off)?;
-        let raw_len = get_u64_le(data, &mut off)?;
-        let data_len = get_u64_le(data, &mut off)? as usize;
-        let end = off + data_len;
-        if end > data.len() {
-            return Err(DecodeError::IO(io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "truncated chunk data",
-            )));
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
+        if n > self.remaining() {
+            return Err(Malformed::Truncated {
+                offset: self.data.len(),
+            });
         }
+        let s = &self.data[self.off..self.off + n];
+        self.off += n;
+        Ok(s)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Malformed> {
+        let mut a = [0; N];
+        a.copy_from_slice(self.take(N)?);
+        Ok(a)
+    }
+
+    fn u32(&mut self) -> Result<u32, Malformed> {
+        self.array().map(u32::from_le_bytes)
+    }
+
+    fn u64(&mut self) -> Result<u64, Malformed> {
+        self.array().map(u64::from_le_bytes)
+    }
+}
+
+/// Parse and validate a patch's header and chunk table.
+///
+/// Nothing is allocated in proportion to sizes the patch declares, only to
+/// the length of `data`.
+pub fn read_patch(data: &[u8]) -> Result<PatchRef<'_>, Error> {
+    let mut c = Cursor { data, off: 0 };
+    let magic = c.u32()?;
+    if magic != MAGIC {
+        return Err(Error::WrongMagic(magic));
+    }
+    let version = c.u32()?;
+    if version != VERSION {
+        return Err(Error::UnsupportedVersion(version));
+    }
+    let new_size = c.u64()?;
+    let num_chunks = c.u32()?;
+    if num_chunks as usize > c.remaining() / CHUNK_META_LEN {
+        return Err(Malformed::ChunkCount {
+            declared: num_chunks,
+        }
+        .into());
+    }
+
+    let mut chunks = Vec::with_capacity(num_chunks as usize);
+    let mut covered = 0u64;
+    for index in 0..num_chunks as usize {
+        let old_start = c.u64()?;
+        let new_start = c.u64()?;
+        let new_len = c.u64()?;
+        let raw_len = c.u64()?;
+        let data_len = c.u64()?;
+        if new_start != covered {
+            return Err(Malformed::ChunkLayout { chunk: index }.into());
+        }
+        covered = new_start
+            .checked_add(new_len)
+            .filter(|&end| end <= new_size)
+            .ok_or(Malformed::ChunkLayout { chunk: index })?;
+        let data_len =
+            usize::try_from(data_len).map_err(|_| Malformed::Truncated { offset: data.len() })?;
         chunks.push(ChunkRef {
+            index,
             old_start,
             new_start,
             new_len,
             raw_len,
-            data: &data[off..end],
+            data: c.take(data_len)?,
         });
-        off = end;
+    }
+    if covered != new_size {
+        return Err(Malformed::ChunkCoverage { covered, new_size }.into());
+    }
+    if c.remaining() != 0 {
+        return Err(Malformed::TrailingData { offset: c.off }.into());
     }
 
     Ok(PatchRef { new_size, chunks })
 }
 
-/// Decode a varint from a byte slice at the given offset.
-/// Returns `None` at EOF (pos == data.len()), or advances pos and returns the value.
-#[inline]
-fn read_varint_slice<V: VarInt>(data: &[u8], pos: &mut usize) -> Option<V> {
-    if *pos >= data.len() {
-        return None;
+impl<'a> PatchRef<'a> {
+    /// Length of the result, as declared by the patch.
+    pub fn new_size(&self) -> u64 {
+        self.new_size
     }
-    let (val, n) = V::decode_var(&data[*pos..])?;
-    *pos += n;
-    Some(val)
+
+    pub fn chunks(&self) -> &[ChunkRef<'a>] {
+        &self.chunks
+    }
+
+    /// Apply the patch to `old`, streaming the result to `out`.
+    ///
+    /// Memory use is bounded by fixed buffers and zstd's window limit, not by
+    /// `new_size`. On error, `out` may already hold part of the result.
+    pub fn apply<W: Write + ?Sized>(&self, old: &[u8], out: &mut W) -> Result<(), Error> {
+        let mut dec = decode::decoder()?;
+        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+        let mut sink = decode::WriteSink::new(out, self.new_size);
+        for chunk in &self.chunks {
+            decode::run_chunk(chunk, old, &mut dec, &mut buf, &mut sink)?;
+        }
+        sink.finish()
+    }
+
+    /// Apply the patch to `old`, writing the result into `out`, which must be
+    /// exactly [`new_size`](Self::new_size) bytes long.
+    ///
+    /// With the `rayon` feature, chunks are applied in parallel.
+    pub fn apply_to_slice(&self, old: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        if out.len() as u64 != self.new_size {
+            return Err(wrong_output_len(out.len(), self.new_size));
+        }
+        let mut regions = Vec::with_capacity(self.chunks.len());
+        let mut rest = out;
+        for chunk in &self.chunks {
+            // read_patch checked that the chunks sum to new_size, which is out.len().
+            let (region, tail) = rest.split_at_mut(chunk.new_len as usize);
+            regions.push((chunk, region));
+            rest = tail;
+        }
+
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            regions.into_par_iter().try_for_each_init(
+                || None,
+                |state, (chunk, region)| {
+                    let (dec, buf) = match state {
+                        Some(s) => s,
+                        None => {
+                            state.insert((decode::decoder()?, vec![0; decode::INSTRUCTION_BUF_LEN]))
+                        }
+                    };
+                    decode::run_chunk(chunk, old, dec, buf, &mut decode::SliceSink::new(region))
+                },
+            )
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            let mut dec = decode::decoder()?;
+            let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+            for (chunk, region) in regions {
+                let mut sink = decode::SliceSink::new(region);
+                decode::run_chunk(chunk, old, &mut dec, &mut buf, &mut sink)?;
+            }
+            Ok(())
+        }
+    }
 }
 
-/// Apply a single chunk's compressed Control stream to produce output bytes.
-///
-/// `old` is the full old file (mmap'd). The chunk's Controls read from `old` starting
-/// at `chunk.old_start`, and write sequentially into `output` (which should be
-/// `chunk.new_len` bytes long).
-///
-/// The chunk's `data` is zstd-compressed; this function decompresses it first using
-/// `chunk.raw_len` as the expected uncompressed size.
-pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], output: &mut [u8]) -> io::Result<()> {
-    // Decompress the chunk's control stream
-    let ctrl = zstd::bulk::decompress(chunk.data, chunk.raw_len as usize)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+fn wrong_output_len(actual: usize, expected: u64) -> Error {
+    Error::Io(io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("output is {actual} bytes but the patch produces {expected}"),
+    ))
+}
 
-    let mut pos: usize = 0;
-    let mut old_pos = chunk.old_start as usize;
-    let mut out_pos: usize = 0;
-
-    while let Some(add_tag) = read_varint_slice::<usize>(&ctrl, &mut pos) {
-        let add_len = add_tag >> 1;
-        if add_len > 0 {
-            if add_tag & 1 == 0 {
-                // Normal ADD: fused delta + wrapping_add
-                let delta = &ctrl[pos..pos + add_len];
-                let old_slice = &old[old_pos..old_pos + add_len];
-                let out_slice = &mut output[out_pos..out_pos + add_len];
-                for i in 0..add_len {
-                    out_slice[i] = delta[i].wrapping_add(old_slice[i]);
-                }
-                pos += add_len;
-            } else {
-                // ZERO-COPY: memcpy from old, no delta bytes in stream
-                output[out_pos..out_pos + add_len]
-                    .copy_from_slice(&old[old_pos..old_pos + add_len]);
-            }
-            old_pos += add_len;
-            out_pos += add_len;
-        }
-
-        // Read copy_tag (LSB = 0: literal, LSB = 1: copy-from-old)
-        let copy_tag: usize = read_varint_slice(&ctrl, &mut pos)
-            .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "truncated copy_tag"))?;
-        let copy_len = copy_tag >> 1;
-
-        if copy_len > 0 {
-            if copy_tag & 1 == 0 {
-                // Literal COPY: bytes from control stream
-                output[out_pos..out_pos + copy_len].copy_from_slice(&ctrl[pos..pos + copy_len]);
-                pos += copy_len;
-            } else {
-                // COPY_OLD: bytes from old file at specified position
-                let old_copy_pos: usize = read_varint_slice(&ctrl, &mut pos).ok_or_else(|| {
-                    io::Error::new(ErrorKind::UnexpectedEof, "truncated copy_old pos")
-                })?;
-                output[out_pos..out_pos + copy_len]
-                    .copy_from_slice(&old[old_copy_pos..old_copy_pos + copy_len]);
-            }
-            out_pos += copy_len;
-        }
-
-        // SEEK: adjust old position
-        let seek: i64 = read_varint_slice(&ctrl, &mut pos)
-            .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "truncated seek"))?;
-        old_pos = (old_pos as i64 + seek) as usize;
+/// Apply one chunk to `old`, writing into `out`, which must be exactly
+/// [`new_len`](ChunkRef::new_len) bytes long.
+pub fn apply_chunk(chunk: &ChunkRef<'_>, old: &[u8], out: &mut [u8]) -> Result<(), Error> {
+    if out.len() as u64 != chunk.new_len {
+        return Err(wrong_output_len(out.len(), chunk.new_len));
     }
+    let mut dec = decode::decoder()?;
+    let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
+    decode::run_chunk(
+        chunk,
+        old,
+        &mut dec,
+        &mut buf,
+        &mut decode::SliceSink::new(out),
+    )
+}
 
-    debug_assert_eq!(out_pos, chunk.new_len as usize);
-    Ok(())
+#[cfg(feature = "diff")]
+pub(crate) fn write_header(out: &mut dyn Write, new_size: u64, num_chunks: u32) -> io::Result<()> {
+    out.write_all(&MAGIC.to_le_bytes())?;
+    out.write_all(&VERSION.to_le_bytes())?;
+    out.write_all(&new_size.to_le_bytes())?;
+    out.write_all(&num_chunks.to_le_bytes())
+}
+
+#[cfg(feature = "diff")]
+pub(crate) fn write_chunk(
+    out: &mut dyn Write,
+    old_start: u64,
+    new_start: u64,
+    new_len: u64,
+    raw_len: u64,
+    data: &[u8],
+) -> io::Result<()> {
+    for v in [old_start, new_start, new_len, raw_len, data.len() as u64] {
+        out.write_all(&v.to_le_bytes())?;
+    }
+    out.write_all(data)
 }
