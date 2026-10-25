@@ -5,9 +5,11 @@ pub const VERSION: u32 = 0x2001;
 
 #[cfg(feature = "diff")]
 use rayon::prelude::*;
-#[cfg(feature = "patch")]
+#[cfg(feature = "diff")]
+use std::cmp::min;
+use std::error::Error;
+#[cfg(all(feature = "diff", feature = "patch"))]
 use std::io::{self, Write};
-use std::{cmp::min, error::Error};
 #[cfg(feature = "diff")]
 use tracing::info;
 
@@ -25,6 +27,7 @@ use std::time::Instant;
 /// Count matching bytes between two slices (up to the shorter length).
 /// Written as an iterator pattern that LLVM reliably auto-vectorizes
 /// into pcmpeqb + horizontal sum.
+#[cfg(feature = "diff")]
 #[inline(always)]
 fn count_matching_bytes(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
@@ -385,6 +388,7 @@ impl<'a> Iterator for BsdiffIterator<'a> {
 }
 
 /// Parameters used when creating diffs
+#[cfg_attr(not(feature = "diff"), allow(dead_code))]
 pub struct DiffParams {
     /// Block size for hash index (default 32). Must be >= 4.
     pub block_size: usize,
@@ -787,7 +791,7 @@ pub fn assert_cycle_with_params(older: &[u8], newer: &[u8], params: &DiffParams)
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "diff"))]
 mod tests {
     use super::instructions::apply_instructions;
     use super::*;
