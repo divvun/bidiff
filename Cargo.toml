@@ -17,7 +17,7 @@ profiling = []
 [dependencies]
 tracing = "0.1"
 integer-encoding = { version = "4", default-features = false, optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 rayon = { version = "1.11", optional = true }
 ringbuf = { version = "0.5.2", optional = true }
 memmap2 = { version = "0.9", optional = true }
