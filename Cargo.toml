@@ -19,16 +19,16 @@ profiling = []
 [dependencies]
 tracing = "0.1"
 integer-encoding = { version = "4", default-features = false, optional = true }
-zstd = { version = "0.13", optional = true }
-rayon = { version = "1.11", optional = true }
-ringbuf = { version = "0.4", optional = true }
+zstd = { version = "0.14", optional = true }
+rayon = { version = "1.12", optional = true }
+ringbuf = { version = "0.5", optional = true }
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 blake3 = { version = "1.8", optional = true }
 
 [dev-dependencies]
 proptest = "1"
-zstd = "0.13"
+zstd = "0.14"
 blake3 = "1.8"
 tempfile = "3"
 
