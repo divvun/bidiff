@@ -40,8 +40,7 @@ fn main() {
                         .collect()
                 }
             }
-            let mut params = DiffParams::new(block, scan_chunk).unwrap();
-            params.use_ram = true;
+            let params = DiffParams::new(block, scan_chunk).unwrap();
             let mut patch = Vec::new();
             bidiff::simple_diff_chunked_with_params(&old, &new, &mut patch, &params, 3).unwrap();
 

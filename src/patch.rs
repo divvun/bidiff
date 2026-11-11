@@ -52,7 +52,7 @@ use std::io::{self, ErrorKind, Write};
 
 mod decode;
 mod error;
-mod frame;
+pub(crate) mod frame;
 mod hash;
 
 pub use blake3::Hash;
@@ -117,24 +117,25 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn remaining(&self) -> usize {
-        self.data.len() - self.off
+        self.data.len().saturating_sub(self.off)
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
-        if n > self.remaining() {
-            return Err(Malformed::Truncated {
-                offset: self.data.len(),
-            });
-        }
-        let s = &self.data[self.off..self.off + n];
+        let data = self.data;
+        let s = self
+            .off
+            .checked_add(n)
+            .and_then(|end| data.get(self.off..end));
+        let s = s.ok_or(Malformed::Truncated { offset: data.len() })?;
         self.off += n;
         Ok(s)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], Malformed> {
-        let mut a = [0; N];
-        a.copy_from_slice(self.take(N)?);
-        Ok(a)
+        let offset = self.data.len();
+        self.take(N)?
+            .try_into()
+            .map_err(|_| Malformed::Truncated { offset })
     }
 
     fn u32(&mut self) -> Result<u32, Malformed> {
@@ -529,22 +530,6 @@ pub(crate) fn write_header(
     out.write_all(&num_chunks.to_le_bytes())
 }
 
-/// Compress a chunk's instruction stream into one frame whose window fits
-/// [`MAX_WINDOW_LOG`].
-///
-/// zstd already shrinks the window to fit small inputs, so only levels whose
-/// default window exceeds the cap are recompressed; capping never raises it.
-#[cfg(feature = "diff")]
-pub(crate) fn compress_chunk(raw: &[u8], level: i32) -> io::Result<Vec<u8>> {
-    let mut compressor = zstd::bulk::Compressor::new(level)?;
-    let compressed = compressor.compress(raw)?;
-    if frame::window_size(&compressed).is_some_and(|w| w > 1 << MAX_WINDOW_LOG) {
-        compressor.set_parameter(zstd::zstd_safe::CParameter::WindowLog(MAX_WINDOW_LOG))?;
-        return compressor.compress(raw);
-    }
-    Ok(compressed)
-}
-
 #[cfg(feature = "diff")]
 pub(crate) fn write_chunk(
     out: &mut dyn Write,
@@ -552,57 +537,10 @@ pub(crate) fn write_chunk(
     new_start: u64,
     new_len: u64,
     raw_len: u64,
-    data: &[u8],
+    data: &mut crate::compress::Spill,
 ) -> io::Result<()> {
-    for v in [old_start, new_start, new_len, raw_len, data.len() as u64] {
+    for v in [old_start, new_start, new_len, raw_len, data.len()] {
         out.write_all(&v.to_le_bytes())?;
     }
-    out.write_all(data)
-}
-
-#[cfg(all(test, feature = "diff"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compress_chunk_caps_the_window() {
-        // Sparse bytes over zeros, longer than the cap, so level 22 would
-        // otherwise pick a larger window.
-        let mut raw = vec![0u8; (1 << MAX_WINDOW_LOG) + (1 << 20)];
-        let mut x = 1u32;
-        for b in raw.iter_mut().step_by(61) {
-            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            *b = (x >> 24) as u8;
-        }
-        let uncapped = zstd::bulk::compress(&raw, 22).unwrap();
-        assert!(frame::window_size(&uncapped).unwrap() > 1 << MAX_WINDOW_LOG);
-
-        let capped = compress_chunk(&raw, 22).unwrap();
-        assert_eq!(frame::window_size(&capped), Some(1 << MAX_WINDOW_LOG));
-        let chunk = ChunkRef {
-            index: 0,
-            old_start: 0,
-            new_start: 0,
-            new_len: raw.len() as u64,
-            raw_len: raw.len() as u64,
-            data: &capped,
-        };
-        let mut dec = decode::decoder().unwrap();
-        let mut buf = vec![0; decode::INSTRUCTION_BUF_LEN];
-        let mut r = decode::Instructions::new(&chunk, &mut dec, &mut buf);
-        let mut out = Vec::new();
-        r.take(raw.len() as u64, |piece| {
-            out.extend_from_slice(piece);
-            Ok(())
-        })
-        .unwrap();
-        assert!(out == raw);
-
-        // Below the cap, a level's own choice stands.
-        let small = &raw[..1 << 20];
-        assert_eq!(
-            compress_chunk(small, 3).unwrap(),
-            zstd::bulk::compress(small, 3).unwrap()
-        );
-    }
+    data.copy_to(out)
 }

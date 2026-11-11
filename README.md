@@ -4,13 +4,13 @@ A binary diff and patch library for Rust, distantly derived from the [bsdiff](ht
 
 Instead of suffix arrays, `bidiff` uses a hash-table index with:
 
-- **File-backed mmap** by default -- the kernel can page the hash table to disk under memory pressure, keeping anonymous memory usage low
-- **Optional `--ram` mode** for faster diffs when memory is plentiful
+- **One memory limit** (`--memory-limit-mb`, `DiffParams::with_memory_limit`) for all of bidiff's own memory: the hash table, the matches scanned ahead, and the zstd compressor. Fixed costs come first, with fewer threads if need be; the hash table stays in RAM if the rest holds it, and otherwise goes in a file in a temporary directory, which the kernel can page to disk under memory pressure. Without a limit, everything is in RAM.
 - **Parallel construction** via lock-free CAS insertion
-- **Parallel scanning** via rayon with ring-buffer channels for streaming matches
+- **Parallel scanning** of chunks ahead of the one being compressed, streaming matches in batches, with a bounded number of chunks in flight
 - **Chunked patch format** with independent zstd-compressed chunks for parallel patch application
 - **Integrity checks**: the patch header carries the size and BLAKE3 hash of the base and of the result, so applying refuses a wrong base before writing anything and checks the result afterwards. The hashes match `b3sum`.
 - **Safe on malformed input**: corrupt, truncated or forged patches return errors rather than panicking, and memory use stays bounded whatever sizes a patch declares: a chunk's zstd window may not exceed 8 MiB, and the parallel path holds at most 128 MiB of decoders
+- **No panics**: diffing and patching return errors instead, and clippy's `unwrap_used`, `expect_used`, `panic` and `indexing_slicing` lints are denied outside tests
 
 ## Usage
 
@@ -38,8 +38,9 @@ The patch format is documented in the `bidiff::patch` module. Version `0x2001` a
 ```
 --scan-chunk-mb <N>   Scan chunk size in MB (default: 1)
 --block-size <N>      Hash index block size, minimum 4 (default: 32)
---threads <N>         Max threads for parallel scanning (default: all cores)
---ram                 Keep hash table in RAM (faster, uses more memory)
+--threads <N>         Max threads for building the index and scanning (default: all cores)
+--memory-limit-mb <N> Hold bidiff's own memory to N MiB (default: no limit, all in RAM)
+--temp-dir <DIR>      Where the hash table goes when it does not fit the limit (default: the system's)
 --max                 Maximize compression (zstd level 22)
 ```
 
@@ -47,7 +48,7 @@ The patch format is documented in the `bidiff::patch` module. Version `0x2001` a
 
 ### System: AMD Ryzen Threadripper 2950X (32 cores), 60 GiB RAM, Linux 6.12.
 
-Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing.
+Measured before the memory limit, when the hash table was in a file by default and in RAM with `--ram`. The patches are the same now. Memory column shows peak anonymous RSS during diffing.
 
 | Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
 |-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
@@ -67,16 +68,16 @@ Smaller patches at the cost of much slower diff times. Patch application speed i
 | Firefox 71.0b11 &rarr; b12 | 198 MiB | 8.3 MiB | 4.20% | 0.11s | 1m 2s | 62.5 MiB | 58.5s | 189 MiB |
 | Chrome 78.0.3904.97 &rarr; 108 | 145 MiB | 5.6 MiB | 3.84% | 0.09s | 1m 18s | 57.6 MiB | 1m 21s | 186 MiB |
 
-### System: Apple M2 Max (12 cores), 32 GiB RAM, macOS 26.1.
+### System: Apple M5 Pro (18 cores), 64 GiB RAM, macOS 27.2.
 
-Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing.
+Default settings (1 MiB chunks), with a 64 MiB memory limit and with none. Memory columns show peak anonymous RSS during diffing.
 
-| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |
-|-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|
-| Wine 4.18 → 4.19 | 201.4 MiB | 249 KiB | 0.120% | 0.194s | 0.258s | 25.7 MiB | 0.198s | 149.7 MiB |
-| Linux 5.3 → 5.4 | 894.7 MiB | 6.8 MiB | 0.762% | 0.918s | 1.400s | 51.0 MiB | 1.004s | 563.4 MiB |
-| Firefox 71.0b11 → b12 | 197.8 MiB | 10.9 MiB | 5.486% | 0.118s | 0.614s | 19.0 MiB | 0.578s | 147.9 MiB |
-| Chrome 78.0.3904.97 → 108 | 145.4 MiB | 57.0 MiB | 39.213% | 0.064s | 0.642s | 12.9 MiB | 0.640s | 13.0 MiB |
+| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (no limit) | Memory (no limit) |
+|-----------|----------|------------|-------|------------|-----------|--------|----------------------|-------------------|
+| Wine 4.18 → 4.19 | 201.4 MiB | 249 KiB | 0.121% | 0.070s | 0.144s | 11.9 MiB | 0.154s | 139.8 MiB |
+| Linux 5.3 → 5.4 | 894.7 MiB | 6.8 MiB | 0.762% | 0.426s | 1.500s | 14.8 MiB | 1.134s | 525.6 MiB |
+| Firefox 71.0b11 → b12 | 197.8 MiB | 10.9 MiB | 5.486% | 0.110s | 0.826s | 14.7 MiB | 0.708s | 141.7 MiB |
+| Chrome 78.0.3904.97 → 108 | 145.4 MiB | 57.0 MiB | 39.213% | 0.044s | 0.512s | 13.1 MiB | 0.510s | 13.0 MiB |
 
 ### Comparison with bidiff 1.1, bsdiff, and xdelta3
 

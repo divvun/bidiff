@@ -1,37 +1,39 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub const MAGIC: u32 = 0xB1DF;
 /// Patch format version. 0x2001 is the first to carry base and result
 /// hashes; patches of any other version are refused, not misread.
 pub const VERSION: u32 = 0x2001;
 
-#[cfg(feature = "diff")]
-use rayon::prelude::*;
-#[cfg(feature = "diff")]
-use std::cmp::min;
 use std::error::Error;
+use std::io;
 #[cfg(all(feature = "diff", feature = "patch"))]
-use std::io::{self, Write};
+use std::io::Write;
+use std::path::PathBuf;
 #[cfg(feature = "diff")]
 use tracing::info;
 
 #[cfg(feature = "diff")]
 use hashindex::HashIndex;
-
 #[cfg(feature = "diff")]
-mod ring_channel;
-#[cfg(feature = "diff")]
-use ring_channel::{RingProducer, ring_channel};
+use plan::Plan;
 
 #[cfg(feature = "profiling")]
 use std::time::Instant;
 
-/// Count matching bytes between two slices (up to the shorter length).
-/// Written as an iterator pattern that LLVM reliably auto-vectorizes
-/// into pcmpeqb + horizontal sum.
-#[cfg(feature = "diff")]
-#[inline(always)]
-fn count_matching_bytes(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()
-}
+#[cfg(all(feature = "diff", feature = "patch"))]
+mod compress;
 
 #[cfg(feature = "patch")]
 pub mod enc;
@@ -41,6 +43,15 @@ pub mod hashindex;
 
 #[cfg(feature = "patch")]
 pub mod patch;
+
+#[cfg(feature = "diff")]
+mod plan;
+
+#[cfg(feature = "diff")]
+mod scan;
+
+#[cfg(feature = "diff")]
+mod threads;
 
 #[cfg(any(test, feature = "instructions"))]
 pub mod instructions;
@@ -53,10 +64,42 @@ pub struct Match {
     pub copy_end: usize,
 }
 
+fn match_out_of_range() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "a match lies outside the files being diffed",
+    )
+}
+
 impl Match {
     #[inline(always)]
     pub fn copy_start(&self) -> usize {
-        self.add_new_start + self.add_length
+        self.add_new_start.saturating_add(self.add_length)
+    }
+
+    /// The new bytes this match adds to old bytes, and those old bytes.
+    fn add_spans<'a>(&self, obuf: &'a [u8], nbuf: &'a [u8]) -> io::Result<(&'a [u8], &'a [u8])> {
+        let span = |buf: &'a [u8], start: usize| {
+            buf.get(start..)
+                .and_then(|b| b.get(..self.add_length))
+                .ok_or_else(match_out_of_range)
+        };
+        Ok((
+            span(nbuf, self.add_new_start)?,
+            span(obuf, self.add_old_start)?,
+        ))
+    }
+
+    /// The new bytes this match copies as they are.
+    fn copy_span<'a>(&self, nbuf: &'a [u8]) -> io::Result<&'a [u8]> {
+        nbuf.get(self.copy_start()..self.copy_end)
+            .ok_or_else(match_out_of_range)
+    }
+
+    /// How far the old cursor moves from the end of this match's add bytes
+    /// to the start of `next`'s.
+    fn seek_to(&self, next: &Match) -> i64 {
+        next.add_old_start as i64 - self.add_old_start.saturating_add(self.add_length) as i64
     }
 }
 
@@ -67,10 +110,13 @@ pub struct Control<'a> {
     pub seek: i64,
 }
 
+/// Turns matches into controls, each sent once the next match gives its
+/// seek. A match outside the files is an
+/// [`InvalidInput`](io::ErrorKind::InvalidInput) error.
 pub struct Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: Error,
+    E: From<io::Error>,
 {
     obuf: &'a [u8],
     nbuf: &'a [u8],
@@ -83,7 +129,7 @@ where
 impl<'a, F, E> Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: Error,
+    E: From<io::Error>,
 {
     pub fn new(obuf: &'a [u8], nbuf: &'a [u8], on_control: F) -> Self {
         Self {
@@ -98,14 +144,12 @@ where
 
     fn send_control(&mut self, m: Option<&Match>) -> Result<(), E> {
         if let Some(pm) = self.prev_match.take() {
+            let copy = pm.copy_span(self.nbuf)?;
+            let seek = m.map_or(0, |m| pm.seek_to(m));
             (self.on_control)(&Control {
-                add: &self.buf[..pm.add_length],
-                copy: &self.nbuf[pm.copy_start()..pm.copy_end],
-                seek: if let Some(m) = m {
-                    m.add_old_start as i64 - (pm.add_old_start + pm.add_length) as i64
-                } else {
-                    0
-                },
+                add: &self.buf,
+                copy,
+                seek,
             })?;
         }
         Ok(())
@@ -114,14 +158,15 @@ where
     pub fn translate(&mut self, m: Match) -> Result<(), E> {
         self.send_control(Some(&m))?;
 
+        let (new, old) = m.add_spans(self.obuf, self.nbuf)?;
         self.buf.clear();
-
-        // Slice + zip lets the compiler see matching lengths and elide bounds
-        // checks, enabling auto-vectorization of the wrapping_sub loop.
-        let n_slice = &self.nbuf[m.add_new_start..m.add_new_start + m.add_length];
-        let o_slice = &self.obuf[m.add_old_start..m.add_old_start + m.add_length];
         self.buf
-            .extend(n_slice.iter().zip(o_slice).map(|(a, b)| a.wrapping_sub(*b)));
+            .try_reserve(new.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        // Zipping slices lets the compiler see matching lengths and elide
+        // bounds checks, enabling auto-vectorization of the wrapping_sub loop.
+        self.buf
+            .extend(new.iter().zip(old).map(|(a, b)| a.wrapping_sub(*b)));
 
         self.prev_match = Some(m);
         Ok(())
@@ -143,261 +188,24 @@ where
 impl<'a, F, E> Drop for Translator<'a, F, E>
 where
     F: FnMut(&Control) -> Result<(), E>,
-    E: Error,
+    E: From<io::Error>,
 {
     fn drop(&mut self) {
         // dropping a Translator ignores errors on purpose,
         // just like File does
-        self.do_close().unwrap_or(());
-    }
-}
-
-#[cfg(feature = "diff")]
-struct BsdiffIterator<'a> {
-    scan: usize,
-    pos: usize,
-    length: usize,
-    lastscan: usize,
-    lastpos: usize,
-    lastoffset: isize,
-    /// Cached hash from prefetch_block, to avoid recomputing on lookup.
-    cached_hash: Option<u64>,
-
-    obuf: &'a [u8],
-    nbuf: &'a [u8],
-    sa: &'a HashIndex<'a>,
-}
-
-#[cfg(feature = "diff")]
-impl<'a> BsdiffIterator<'a> {
-    pub fn new(obuf: &'a [u8], nbuf: &'a [u8], sa: &'a HashIndex<'a>) -> Self {
-        Self {
-            scan: 0,
-            pos: 0,
-            length: 0,
-            lastscan: 0,
-            lastpos: 0,
-            lastoffset: 0,
-            cached_hash: None,
-            obuf,
-            nbuf,
-            sa,
-        }
-    }
-}
-
-#[cfg(feature = "diff")]
-impl<'a> Iterator for BsdiffIterator<'a> {
-    type Item = Match;
-    fn next(&mut self) -> Option<Self::Item> {
-        let obuflen = self.obuf.len();
-        let nbuflen = self.nbuf.len();
-
-        while self.scan < nbuflen {
-            let mut oldscore = 0_isize;
-            self.scan += self.length;
-
-            let mut scsc = self.scan;
-            'inner: while self.scan < nbuflen {
-                let res = if let Some(h) = self.cached_hash.take() {
-                    self.sa
-                        .longest_substring_match_with_hash(&self.nbuf[self.scan..], h)
-                } else {
-                    self.sa.longest_substring_match(&self.nbuf[self.scan..])
-                };
-                // Prefetch the table bucket for the next scan position and cache the hash.
-                // The oldscore + scoring work below provides the latency window.
-                self.cached_hash = if self.scan + 1 < nbuflen {
-                    self.sa.prefetch_block(&self.nbuf[self.scan + 1..])
-                } else {
-                    None
-                };
-                // Lookahead prefetches: warm table buckets for upcoming scan positions.
-                // We don't cache these hashes — the CPU pipelines the independent
-                // hash computations via out-of-order execution, so recomputation is free.
-                if self.scan + 2 < nbuflen {
-                    self.sa.prefetch_block(&self.nbuf[self.scan + 2..]);
-                }
-                if self.scan + 3 < nbuflen {
-                    self.sa.prefetch_block(&self.nbuf[self.scan + 3..]);
-                }
-                self.pos = res.start;
-                self.length = res.len;
-
-                {
-                    let end = self.scan + self.length;
-                    if scsc < end {
-                        // Pre-compute the obuf range corresponding to nbuf[scsc..end]
-                        let o_start = scsc as isize + self.lastoffset;
-                        let o_end = end as isize + self.lastoffset;
-                        if o_start >= 0 && o_end as usize <= obuflen {
-                            // Fast path: entire range is in bounds — auto-vectorizable
-                            let o_start = o_start as usize;
-                            oldscore += count_matching_bytes(
-                                &self.obuf[o_start..o_start + (end - scsc)],
-                                &self.nbuf[scsc..end],
-                            ) as isize;
-                        } else {
-                            // Slow path: partial bounds (rare, near buffer edges)
-                            for i in scsc..end {
-                                let oi = (i as isize + self.lastoffset) as usize;
-                                if oi < obuflen && self.obuf[oi] == self.nbuf[i] {
-                                    oldscore += 1;
-                                }
-                            }
-                        }
-                        scsc = end;
-                    }
-                }
-
-                let significantly_better = self.length as isize > oldscore + 8;
-                let same_length = self.length as isize == oldscore && self.length != 0;
-
-                if same_length || significantly_better {
-                    // Prefetch for the actual next scan position (scan + length),
-                    // not scan + 1 which is now stale. The lenf/lenb computation
-                    // below provides ample latency window for the prefetch.
-                    self.cached_hash = if self.scan + self.length < nbuflen {
-                        self.sa
-                            .prefetch_block(&self.nbuf[self.scan + self.length..])
-                    } else {
-                        None
-                    };
-                    break 'inner;
-                }
-
-                {
-                    let oi = (self.scan as isize + self.lastoffset) as usize;
-                    if oi < obuflen && self.obuf[oi] == self.nbuf[self.scan] {
-                        oldscore -= 1;
-                    }
-                }
-                self.scan += 1;
-            } // 'inner
-
-            let done_scanning = self.scan == nbuflen;
-            if self.length as isize != oldscore || done_scanning {
-                // length forward from lastscan
-                let mut lenf = {
-                    let (mut s, mut sf, mut lenf) = (0_isize, 0_isize, 0_isize);
-
-                    let n = min(self.scan - self.lastscan, obuflen - self.lastpos);
-                    let o_slice = &self.obuf[self.lastpos..self.lastpos + n];
-                    let n_slice = &self.nbuf[self.lastscan..self.lastscan + n];
-
-                    for i in 0..n {
-                        if o_slice[i] == n_slice[i] {
-                            s += 1;
-                        }
-
-                        {
-                            // the original code has an `i++` in the
-                            // middle of what's essentially a while loop.
-                            let i = i + 1;
-                            if s * 2 - i as isize > sf * 2 - lenf {
-                                sf = s;
-                                lenf = i as isize;
-                            }
-                        }
-                    }
-                    lenf as usize
-                };
-
-                // length backwards from scan
-                let mut lenb = if self.scan >= nbuflen {
-                    0
-                } else {
-                    let (mut s, mut sb, mut lenb) = (0_isize, 0_isize, 0_isize);
-
-                    let n = min(self.scan - self.lastscan, self.pos);
-                    // Pre-slice: iterate backwards from pos/scan
-                    let o_slice = &self.obuf[self.pos - n..self.pos];
-                    let n_slice = &self.nbuf[self.scan - n..self.scan];
-
-                    for i in 1..=n {
-                        // index from end of pre-sliced regions
-                        if o_slice[n - i] == n_slice[n - i] {
-                            s += 1;
-                        }
-
-                        if (s * 2 - i as isize) > (sb * 2 - lenb) {
-                            sb = s;
-                            lenb = i as isize;
-                        }
-                    }
-                    lenb as usize
-                };
-
-                let lastscan_was_better = self.lastscan + lenf > self.scan - lenb;
-                if lastscan_was_better {
-                    // if our last scan went forward more than
-                    // our current scan went back, figure out how much
-                    // of our current scan to crop based on scoring
-                    let overlap = (self.lastscan + lenf) - (self.scan - lenb);
-
-                    let lens = {
-                        let (mut s, mut ss, mut lens) = (0, 0, 0);
-                        // Pre-slice all four regions to eliminate bounds checks
-                        let last_n =
-                            &self.nbuf[self.lastscan + lenf - overlap..self.lastscan + lenf];
-                        let last_o = &self.obuf[self.lastpos + lenf - overlap..self.lastpos + lenf];
-                        let cur_n = &self.nbuf[self.scan - lenb..self.scan - lenb + overlap];
-                        let cur_o = &self.obuf[self.pos - lenb..self.pos - lenb + overlap];
-                        for i in 0..overlap {
-                            if last_n[i] == last_o[i] {
-                                // point goes to last scan
-                                s += 1;
-                            }
-                            if cur_n[i] == cur_o[i] {
-                                // point goes to current scan
-                                s -= 1;
-                            }
-
-                            // new high score for last scan?
-                            if s > ss {
-                                ss = s;
-                                lens = i + 1;
-                            }
-                        }
-                        lens
-                    };
-                    // order matters to avoid overflow
-                    lenf += lens;
-                    lenf -= overlap;
-
-                    lenb -= lens;
-                } // lastscan was better
-
-                let m = Match {
-                    add_old_start: self.lastpos,
-                    add_new_start: self.lastscan,
-                    add_length: lenf,
-                    copy_end: self.scan - lenb,
-                };
-
-                self.lastscan = self.scan - lenb;
-                self.lastpos = self.pos - lenb;
-                self.lastoffset = self.pos as isize - self.scan as isize;
-
-                return Some(m);
-            } // interesting score, or done scanning
-        } // 'outer - done scanning for good
-
-        None
+        let _ = self.do_close();
     }
 }
 
 /// Parameters used when creating diffs
+#[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "diff"), allow(dead_code))]
 pub struct DiffParams {
-    /// Block size for hash index (default 32). Must be >= 4.
-    pub block_size: usize,
-    pub(crate) scan_chunk_size: Option<usize>,
-    /// Max threads for parallel scanning. `None` = use all available cores.
-    pub(crate) num_threads: Option<usize>,
-    /// Use anonymous mmap (RAM) instead of file-backed mmap for the hash table.
-    /// Faster but pins memory that can't be paged to disk.
-    pub use_ram: bool,
+    block_size: usize,
+    scan_chunk_size: Option<usize>,
+    num_threads: Option<usize>,
+    memory_limit: Option<usize>,
+    temp_dir: Option<PathBuf>,
 }
 
 impl DiffParams {
@@ -417,7 +225,8 @@ impl DiffParams {
         Self::with_threads(block_size, scan_chunk_size, None)
     }
 
-    /// Like `new`, but also sets the maximum number of threads for parallel scanning.
+    /// Like `new`, but also sets the maximum number of threads that build
+    /// the hash table and scan. `None` uses one per core.
     pub fn with_threads(
         block_size: usize,
         scan_chunk_size: Option<usize>,
@@ -437,8 +246,50 @@ impl DiffParams {
             block_size,
             scan_chunk_size,
             num_threads,
-            use_ram: false,
+            memory_limit: None,
+            temp_dir: None,
         })
+    }
+
+    /// Hold the memory bidiff itself uses for a diff to `bytes`. That is:
+    ///
+    /// - the hash table, half a byte to a byte per byte of the old file
+    ///   ([`hashindex::table_bytes`]);
+    /// - the matches scanned ahead of the one chunk being written, about
+    ///   400 KiB per thread with each thread's stack;
+    /// - when writing a patch, the zstd compressor, which zstd sizes for the
+    ///   level and scan chunk size, and the chunk being compressed, up to its
+    ///   own size or 8 MiB, whichever is less.
+    ///
+    /// All but the table have a fixed size, which comes out of the limit
+    /// first, with fewer threads than asked for if they do not all fit; if
+    /// one thread does not, the diff fails with
+    /// [`OutOfMemory`](io::ErrorKind::OutOfMemory) before it starts. The
+    /// table then stays in RAM if the rest of the limit holds it, and
+    /// otherwise goes in a file in the [temporary
+    /// directory](Self::with_temp_dir), whose pages the kernel writes out
+    /// under memory pressure rather than holding them; so does the part of a
+    /// compressed chunk past what is held.
+    ///
+    /// The two files being diffed and whatever the patch is written to are
+    /// the caller's, and not counted. Without a limit, everything is held in
+    /// RAM.
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// The directory for the files a [memory limit](Self::with_memory_limit)
+    /// sends work to. The default, [`std::env::temp_dir`], is kept in RAM
+    /// (tmpfs) on some systems, where those files hold memory after all.
+    pub fn with_temp_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.temp_dir = Some(dir.into());
+        self
+    }
+
+    #[cfg(feature = "diff")]
+    pub(crate) fn temp_dir(&self) -> PathBuf {
+        self.temp_dir.clone().unwrap_or_else(std::env::temp_dir)
     }
 }
 
@@ -448,7 +299,8 @@ impl Default for DiffParams {
             block_size: 32,
             scan_chunk_size: None,
             num_threads: None,
-            use_ram: false,
+            memory_limit: None,
+            temp_dir: None,
         }
     }
 }
@@ -458,85 +310,18 @@ impl Default for DiffParams {
 pub fn diff<F, E>(obuf: &[u8], nbuf: &[u8], params: &DiffParams, mut on_match: F) -> Result<(), E>
 where
     F: FnMut(Match) -> Result<(), E>,
+    E: From<io::Error>,
 {
-    #[cfg(feature = "profiling")]
-    let before_index = Instant::now();
-
-    let index = HashIndex::new(obuf, params.block_size, params.use_ram);
-
-    #[cfg(feature = "profiling")]
-    info!(
-        "index build took {}",
-        DurationSpeed(obuf.len() as u64, before_index.elapsed())
-    );
-
-    #[cfg(feature = "profiling")]
-    let before_scan = Instant::now();
-
-    if let Some(chunk_size) = params.scan_chunk_size {
-        let num_chunks = nbuf.len().div_ceil(chunk_size);
-
-        info!(
-            "scanning with {}B chunks... ({} chunks total)",
-            chunk_size, num_chunks
-        );
-
-        let mut producers = Vec::with_capacity(num_chunks);
-        let mut consumers = Vec::with_capacity(num_chunks);
-        for _ in 0..num_chunks {
-            let (cons, prod) = ring_channel::<Match>(8192);
-            producers.push(prod);
-            consumers.push(cons);
+    let chunk_size = params.scan_chunk_size;
+    diff_chunked(obuf, nbuf, params, |i, _, matches, _| {
+        let offset = chunk_size.map_or(0, |size| i * size);
+        for mut m in matches {
+            m.add_new_start += offset;
+            m.copy_end += offset;
+            on_match(m)?;
         }
-
-        let do_scan = |producers: Vec<RingProducer<Match>>| {
-            nbuf.par_chunks(chunk_size)
-                .zip(producers)
-                .for_each(|(nbuf, mut prod)| {
-                    for m in BsdiffIterator::new(obuf, nbuf, &index) {
-                        prod.push(m);
-                    }
-                });
-        };
-
-        let num_threads = params.num_threads;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                if let Some(n) = num_threads {
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(n)
-                        .build()
-                        .expect("failed to build thread pool");
-                    pool.install(|| do_scan(producers));
-                } else {
-                    do_scan(producers);
-                }
-            });
-
-            for (i, mut cons) in consumers.into_iter().enumerate() {
-                let offset = i * chunk_size;
-                while let Some(mut m) = cons.pop() {
-                    m.add_new_start += offset;
-                    m.copy_end += offset;
-                    on_match(m)?;
-                }
-            }
-
-            Ok::<(), E>(())
-        })?;
-    } else {
-        for m in BsdiffIterator::new(obuf, nbuf, &index) {
-            on_match(m)?
-        }
-    }
-
-    #[cfg(feature = "profiling")]
-    info!(
-        "scanning took {}",
-        DurationSpeed(obuf.len() as u64, before_scan.elapsed())
-    );
-
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(feature = "profiling")]
@@ -584,20 +369,46 @@ use profiling::DurationSpeed;
 
 /// Like `diff()`, but calls `on_chunk(chunk_index, chunk_nbuf, matches, hash_index)` per chunk
 /// with chunk-relative match positions (add_new_start/copy_end NOT offset-adjusted).
+///
+/// Chunks come in order, on the calling thread, while later ones are
+/// scanned on others. If `on_chunk` fails, scanning stops and its error is
+/// returned; it need not take all of a chunk's matches.
 #[cfg(feature = "diff")]
 pub fn diff_chunked<F, E>(
     obuf: &[u8],
     nbuf: &[u8],
     params: &DiffParams,
+    on_chunk: F,
+) -> Result<(), E>
+where
+    F: FnMut(usize, &[u8], &mut dyn Iterator<Item = Match>, &HashIndex) -> Result<(), E>,
+    E: From<io::Error>,
+{
+    let plan = Plan::new(params, obuf.len(), 0)?;
+    run(obuf, nbuf, params, &plan, on_chunk)
+}
+
+#[cfg(feature = "diff")]
+fn run<F, E>(
+    obuf: &[u8],
+    nbuf: &[u8],
+    params: &DiffParams,
+    plan: &Plan,
     mut on_chunk: F,
 ) -> Result<(), E>
 where
     F: FnMut(usize, &[u8], &mut dyn Iterator<Item = Match>, &HashIndex) -> Result<(), E>,
+    E: From<io::Error>,
 {
     #[cfg(feature = "profiling")]
     let before_index = Instant::now();
 
-    let index = HashIndex::new(obuf, params.block_size, params.use_ram);
+    let index = HashIndex::new(
+        obuf,
+        params.block_size,
+        plan.table_dir.as_deref(),
+        plan.threads,
+    )?;
 
     #[cfg(feature = "profiling")]
     info!(
@@ -608,61 +419,26 @@ where
     #[cfg(feature = "profiling")]
     let before_scan = Instant::now();
 
-    if let Some(chunk_size) = params.scan_chunk_size {
-        let num_chunks = nbuf.len().div_ceil(chunk_size);
-
-        info!(
-            "scanning with {}B chunks... ({} chunks total)",
-            chunk_size, num_chunks
-        );
-
-        let mut producers = Vec::with_capacity(num_chunks);
-        let mut consumers = Vec::with_capacity(num_chunks);
-        for _ in 0..num_chunks {
-            let (cons, prod) = ring_channel::<Match>(8192);
-            producers.push(prod);
-            consumers.push(cons);
+    match params.scan_chunk_size {
+        Some(chunk_size) => {
+            info!(
+                "scanning with {}B chunks... ({} chunks total)",
+                chunk_size,
+                nbuf.len().div_ceil(chunk_size)
+            );
+            scan::chunks(
+                obuf,
+                nbuf,
+                chunk_size,
+                &index,
+                plan.threads,
+                |i, chunk, matches| on_chunk(i, chunk, matches, &index),
+            )?;
         }
-
-        let do_scan = |producers: Vec<RingProducer<Match>>| {
-            nbuf.par_chunks(chunk_size)
-                .zip(producers)
-                .for_each(|(nbuf, mut prod)| {
-                    for m in BsdiffIterator::new(obuf, nbuf, &index) {
-                        prod.push(m);
-                    }
-                });
-        };
-
-        let num_threads = params.num_threads;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                if let Some(n) = num_threads {
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(n)
-                        .build()
-                        .expect("failed to build thread pool");
-                    pool.install(|| do_scan(producers));
-                } else {
-                    do_scan(producers);
-                }
-            });
-
-            for (i, mut cons) in consumers.into_iter().enumerate() {
-                let start = i * chunk_size;
-                let end = (start + chunk_size).min(nbuf.len());
-                let chunk_nbuf = &nbuf[start..end];
-                let mut iter = std::iter::from_fn(|| cons.pop());
-                on_chunk(i, chunk_nbuf, &mut iter, &index)?;
-            }
-
-            Ok::<(), E>(())
-        })?;
-    } else {
-        // Non-chunked path: single-threaded scan.
-        index.populate();
-        let mut iter = BsdiffIterator::new(obuf, nbuf, &index);
-        on_chunk(0, nbuf, &mut iter, &index)?;
+        None => {
+            let mut matches = scan::BsdiffIterator::new(obuf, nbuf, &index);
+            on_chunk(0, nbuf, &mut matches, &index)?;
+        }
     }
 
     #[cfg(feature = "profiling")]
@@ -674,7 +450,37 @@ where
     Ok(())
 }
 
+/// Write a chunk's instruction stream to `w`: a control per match, each
+/// written once the next match gives its seek. Returns where in `older` the
+/// first match starts.
+#[cfg(all(feature = "diff", feature = "patch"))]
+fn write_instructions(
+    older: &[u8],
+    chunk: &[u8],
+    matches: &mut dyn Iterator<Item = Match>,
+    w: &mut dyn Write,
+) -> io::Result<usize> {
+    let mut w = enc::Writer::new(w);
+    let write = |w: &mut enc::Writer<_>, m: &Match, seek| {
+        let (new, old) = m.add_spans(older, chunk)?;
+        w.write_diff(new, old, m.copy_span(chunk)?, seek)
+    };
+    let Some(mut prev) = matches.next() else {
+        return Ok(0);
+    };
+    let first_old_start = prev.add_old_start;
+    for m in matches {
+        write(&mut w, &prev, prev.seek_to(&m))?;
+        prev = m;
+    }
+    write(&mut w, &prev, 0)?;
+    Ok(first_old_start)
+}
+
 /// Produce a chunked patch: header + independent zstd-compressed sub-patches per scan chunk.
+///
+/// Nothing is written if the diff cannot start, as when the memory limit is
+/// too small. Otherwise an error leaves `out` holding part of a patch.
 #[cfg(all(feature = "diff", feature = "patch"))]
 pub fn simple_diff_chunked_with_params(
     older: &[u8],
@@ -697,97 +503,38 @@ pub fn simple_diff_chunked_with_params(
         )
     })?;
 
+    let held = match diff_params.memory_limit {
+        Some(_) => chunk_size.min(compress::MAX_HELD),
+        None => usize::MAX,
+    };
+    let compressor = compress::memory(zstd_level, chunk_size)?;
+    let plan = Plan::new(diff_params, older.len(), compressor.saturating_add(held))?;
+    let mut compressor = compress::ChunkCompressor::new(zstd_level, chunk_size)?;
+    let mut frame = compress::Spill::new(held, diff_params.temp_dir());
+
     patch::write_header(out, older, newer, num_chunks)?;
 
-    diff_chunked(
+    run(
         older,
         newer,
         diff_params,
+        &plan,
         |i, chunk_nbuf, matches, _index| {
-            let new_start = i * chunk_size;
-            let new_len = chunk_nbuf.len();
-
-            // Collect sub-patch Controls into a buffer
-            let mut sub_patch = Vec::new();
-            let mut w = enc::Writer::new(&mut sub_patch);
-            let mut first_old_start: u64 = 0;
-            let mut is_first = true;
-
-            let mut translator =
-                Translator::new(older, chunk_nbuf, |control| -> Result<(), io::Error> {
-                    w.write_extended(control, None)
-                });
-
-            #[allow(clippy::while_let_on_iterator)]
-            while let Some(m) = matches.next() {
-                if is_first {
-                    first_old_start = m.add_old_start as u64;
-                    is_first = false;
-                }
-                translator.translate(m)?;
-            }
-            translator.close()?;
-
-            // Compress sub-patch independently
-            let raw_len = sub_patch.len() as u64;
-            let compressed = patch::compress_chunk(&sub_patch, zstd_level)?;
-
+            let mut first_old_start = 0;
+            let raw_len = compressor.frame(&mut frame, |w| {
+                first_old_start = write_instructions(older, chunk_nbuf, matches, w)?;
+                Ok(())
+            })?;
             patch::write_chunk(
                 out,
-                first_old_start,
-                new_start as u64,
-                new_len as u64,
+                first_old_start as u64,
+                (i * chunk_size) as u64,
+                chunk_nbuf.len() as u64,
                 raw_len,
-                &compressed,
+                &mut frame,
             )
         },
-    )?;
-
-    Ok(())
-}
-
-#[cfg(feature = "diff")]
-pub fn assert_cycle(older: &[u8], newer: &[u8]) {
-    assert_cycle_with_params(older, newer, &Default::default());
-}
-
-#[cfg(feature = "diff")]
-pub fn assert_cycle_with_params(older: &[u8], newer: &[u8], params: &DiffParams) {
-    let mut older_pos = 0_usize;
-    let mut newer_pos = 0_usize;
-
-    let mut translator = Translator::new(older, newer, |control| -> Result<(), std::io::Error> {
-        for &ab in control.add {
-            let fb = ab.wrapping_add(older[older_pos]);
-            older_pos += 1;
-
-            let nb = newer[newer_pos];
-            newer_pos += 1;
-
-            assert_eq!(fb, nb);
-        }
-
-        for &cb in control.copy {
-            let nb = newer[newer_pos];
-            newer_pos += 1;
-
-            assert_eq!(cb, nb);
-        }
-
-        older_pos = (older_pos as i64 + control.seek) as usize;
-
-        Ok(())
-    });
-
-    diff(older, newer, params, |m| translator.translate(m)).unwrap();
-
-    translator.close().unwrap();
-
-    assert_eq!(
-        newer_pos,
-        newer.len(),
-        "fresh should have same length as newer"
-    );
+    )
 }
 
 #[cfg(all(test, feature = "diff"))]
@@ -795,6 +542,48 @@ mod tests {
     use super::instructions::apply_instructions;
     use super::*;
     use proptest::prelude::*;
+
+    fn assert_cycle(older: &[u8], newer: &[u8]) {
+        assert_cycle_with_params(older, newer, &Default::default());
+    }
+
+    fn assert_cycle_with_params(older: &[u8], newer: &[u8], params: &DiffParams) {
+        let mut older_pos = 0_usize;
+        let mut newer_pos = 0_usize;
+
+        let mut translator = Translator::new(older, newer, |control| -> Result<(), io::Error> {
+            for &ab in control.add {
+                let fb = ab.wrapping_add(older[older_pos]);
+                older_pos += 1;
+
+                let nb = newer[newer_pos];
+                newer_pos += 1;
+
+                assert_eq!(fb, nb);
+            }
+
+            for &cb in control.copy {
+                let nb = newer[newer_pos];
+                newer_pos += 1;
+
+                assert_eq!(cb, nb);
+            }
+
+            older_pos = (older_pos as i64 + control.seek) as usize;
+
+            Ok(())
+        });
+
+        diff(older, newer, params, |m| translator.translate(m)).unwrap();
+
+        translator.close().unwrap();
+
+        assert_eq!(
+            newer_pos,
+            newer.len(),
+            "fresh should have same length as newer"
+        );
+    }
 
     #[test]
     fn short_patch() {
@@ -808,7 +597,21 @@ mod tests {
         ];
         let newer = apply_instructions(&older[..], &instructions[..]);
 
-        super::assert_cycle(&older[..], &newer[..]);
+        assert_cycle(&older[..], &newer[..]);
+    }
+
+    #[test]
+    fn translator_refuses_matches_outside_the_files() {
+        let (older, newer) = (b"abcdefgh", b"abcdefgh");
+        let mut translator = Translator::new(older, newer, |_| -> Result<(), io::Error> { Ok(()) });
+        let m = Match {
+            add_old_start: 4,
+            add_new_start: 0,
+            add_length: 5,
+            copy_end: 5,
+        };
+        let err = translator.translate(m).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     proptest! {
@@ -816,7 +619,7 @@ mod tests {
         fn cycle(older: [u8; 32], instructions: [u8; 32]) {
             let newer = apply_instructions(&older[..], &instructions[..]);
             println!("{} => {}", older.len(), newer.len());
-            super::assert_cycle(&older[..], &newer[..]);
+            assert_cycle(&older[..], &newer[..]);
         }
 
         #[test]
@@ -826,7 +629,18 @@ mod tests {
         ) {
             let newer = apply_instructions(&older[..], &instructions[..]);
             let params = DiffParams::new(4, None).unwrap();
-            super::assert_cycle_with_params(&older[..], &newer[..], &params);
+            assert_cycle_with_params(&older[..], &newer[..], &params);
+        }
+
+        #[test]
+        fn cycle_chunked(
+            older in proptest::collection::vec(any::<u8>(), 64..512),
+            instructions in proptest::collection::vec(any::<u8>(), 32..128),
+            chunk in 1usize..100,
+        ) {
+            let newer = apply_instructions(&older[..], &instructions[..]);
+            let params = DiffParams::with_threads(4, Some(chunk), Some(3)).unwrap();
+            assert_cycle_with_params(&older[..], &newer[..], &params);
         }
     }
 }

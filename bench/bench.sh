@@ -262,6 +262,10 @@ else
     WARMUP=0
 fi
 
+# The limit the first pair of columns is measured under; the second has none.
+LIMIT_MB=64
+LIMIT="--memory-limit-mb $LIMIT_MB"
+
 for i in "${!NAMES[@]}"; do
     name="${NAMES[$i]}"
     older="${OLDERS[$i]}"
@@ -274,9 +278,9 @@ for i in "${!NAMES[@]}"; do
     declare -a dtimes=() ptimes=() dtimes_ram=()
 
     TOTAL=$((WARMUP + RUNS))
-    echo "  file-backed (timing, ${RUNS} runs)..."
+    echo "  limited (timing, ${RUNS} runs)..."
     for r in $(seq 1 $TOTAL); do
-        output=$("$BIDIFF" cycle "$older" "$newer" 2>/dev/null)
+        output=$("$BIDIFF" cycle "$older" "$newer" $LIMIT 2>/dev/null)
         if [ "$r" -le "$WARMUP" ]; then
             echo "    warmup: $output"
             continue
@@ -295,9 +299,9 @@ for i in "${!NAMES[@]}"; do
     R_DTIME+=("$(average "${dtimes[@]}")")
     R_PTIME+=("$(average "${ptimes[@]}")")
 
-    echo "  RAM (timing, ${RUNS} runs)..."
+    echo "  no limit (timing, ${RUNS} runs)..."
     for r in $(seq 1 $TOTAL); do
-        output=$("$BIDIFF" cycle "$older" "$newer" --ram 2>/dev/null)
+        output=$("$BIDIFF" cycle "$older" "$newer" 2>/dev/null)
         if [ "$r" -le "$WARMUP" ]; then
             echo "    warmup: $output"
             continue
@@ -313,14 +317,14 @@ for i in "${!NAMES[@]}"; do
     unset dtimes ptimes dtimes_ram
 
     # Memory measurement runs (single run each, separate from timing)
-    echo "  file-backed (memory)..."
-    output=$("$BIDIFF" cycle "$older" "$newer" --with-anon 2>/dev/null)
+    echo "  limited (memory)..."
+    output=$("$BIDIFF" cycle "$older" "$newer" $LIMIT --with-anon 2>/dev/null)
     echo "  $output"
     parse_cycle "$output"
     R_MEM+=("$ANON")
 
-    echo "  RAM (memory)..."
-    output=$("$BIDIFF" cycle "$older" "$newer" --ram --with-anon 2>/dev/null)
+    echo "  no limit (memory)..."
+    output=$("$BIDIFF" cycle "$older" "$newer" --with-anon 2>/dev/null)
     echo "  $output"
     parse_cycle "$output"
     R_MEM_RAM+=("$ANON")
@@ -332,10 +336,10 @@ echo ""
 echo ""
 system_info
 echo ""
-echo "Default settings (1 MiB chunks, file-backed hash table). Memory column shows peak anonymous RSS during diffing."
+echo "Default settings (1 MiB chunks), with a ${LIMIT_MB} MiB memory limit and with none. Memory columns show peak anonymous RSS during diffing."
 echo ""
-echo "| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (RAM) | Memory (RAM) |"
-echo "|-----------|----------|------------|-------|------------|-----------|--------|-----------------|--------------|"
+echo "| Test case | New size | Patch size | Ratio | Patch time | Diff time | Memory | Diff time (no limit) | Memory (no limit) |"
+echo "|-----------|----------|------------|-------|------------|-----------|--------|----------------------|-------------------|"
 
 for i in "${!R_NAME[@]}"; do
     echo "| ${R_NAME[$i]} | ${R_NEW_SIZE[$i]} | ${R_PATCH_SIZE[$i]} | ${R_RATIO[$i]}% | $(fmt_time "${R_PTIME[$i]}") | $(fmt_time "${R_DTIME[$i]}") | ${R_MEM[$i]} | $(fmt_time "${R_DTIME_RAM[$i]}") | ${R_MEM_RAM[$i]} |"

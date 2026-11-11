@@ -1,30 +1,34 @@
 /// Generate a "newer" input from an "older" input and a set of instructions
 pub fn apply_instructions(older: &[u8], instructions: &[u8]) -> Vec<u8> {
-    use std::cmp::min;
     let mut newer = older.to_vec();
 
-    for couple in instructions.chunks(2) {
-        if couple.len() != 2 {
-            break;
-        }
-        let (i, j) = (couple[0], couple[1]);
-
+    for &[i, j] in instructions.as_chunks::<2>().0 {
         if i < 128 {
-            let pos = (i as usize) % newer.len();
-            let len = j as usize;
-            let data = newer[pos..min(pos + len, newer.len())].to_vec();
-            for c in data {
-                newer.push(c);
-            }
+            // Repeat up to j bytes from a position in what is there so far.
+            let Some(pos) = (i as usize).checked_rem(newer.len()) else {
+                continue;
+            };
+            let end = newer.len().min(pos + j as usize);
+            newer.extend_from_within(pos..end);
         } else if i < 150 {
-            for _ in 0..(i - 128) {
-                newer.push(j);
-            }
+            newer.extend(std::iter::repeat_n(j, (i - 128) as usize));
         } else {
-            let a = (j as usize) % newer.len();
+            let Some(a) = (j as usize).checked_rem(newer.len()) else {
+                continue;
+            };
             let b = (a + 1) % newer.len();
             newer.swap(a, b);
         }
     }
     newer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_older() {
+        assert_eq!(apply_instructions(b"", &[1, 4, 130, 7, 200, 0]), [7, 7]);
+    }
 }

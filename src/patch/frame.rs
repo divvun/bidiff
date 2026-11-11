@@ -18,7 +18,12 @@ pub(crate) fn window_size(frame: &[u8]) -> Option<u64> {
         return Some(base + base / 8 * u64::from(window & 7));
     }
     // A single-segment frame's window is its content size.
-    let dictionary_id_len = [0, 1, 2, 4][usize::from(descriptor & 3)];
+    let dictionary_id_len = match descriptor & 3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
     let at = 5 + dictionary_id_len;
     Some(match descriptor >> 6 {
         0 => u64::from(*frame.get(at)?),

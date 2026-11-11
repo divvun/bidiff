@@ -26,8 +26,7 @@ pub mod layout {
 }
 
 pub fn make_patch(old: &[u8], new: &[u8], scan_chunk: Option<usize>, block: usize) -> Vec<u8> {
-    let mut params = DiffParams::new(block, scan_chunk).unwrap();
-    params.use_ram = true;
+    let params = DiffParams::new(block, scan_chunk).unwrap();
     let mut out = Vec::new();
     bidiff::simple_diff_chunked_with_params(old, new, &mut out, &params, 3).unwrap();
     out

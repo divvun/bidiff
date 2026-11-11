@@ -1,5 +1,8 @@
-use std::cmp::min;
+use crate::threads;
 use std::fmt;
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Inlined from sacabase: common_prefix_len, LongestCommonSubstring
@@ -12,85 +15,78 @@ pub struct LongestCommonSubstring {
 
 impl fmt::Debug for LongestCommonSubstring {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "T[{}..{}]", self.start, self.start + self.len)
+        write!(
+            f,
+            "T[{}..{}]",
+            self.start,
+            self.start.saturating_add(self.len)
+        )
     }
 }
 
+const NO_MATCH: LongestCommonSubstring = LongestCommonSubstring { start: 0, len: 0 };
+
 pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    let n = min(a.len(), b.len());
-    let mut i = 0;
+    let (a_words, _) = a.as_chunks::<8>();
+    let (b_words, _) = b.as_chunks::<8>();
+    let mut len = 0;
 
     // Compare 8 bytes at a time using u64 XOR
-    while i + 8 <= n {
-        let a_chunk = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
-        let b_chunk = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
-        let xor = a_chunk ^ b_chunk;
+    for (x, y) in a_words.iter().zip(b_words) {
+        let xor = u64::from_ne_bytes(*x) ^ u64::from_ne_bytes(*y);
         if xor != 0 {
             #[cfg(target_endian = "little")]
-            {
-                return i + (xor.trailing_zeros() as usize / 8);
-            }
+            return len + (xor.trailing_zeros() / 8) as usize;
             #[cfg(target_endian = "big")]
-            {
-                return i + (xor.leading_zeros() as usize / 8);
-            }
+            return len + (xor.leading_zeros() / 8) as usize;
         }
-        i += 8;
+        len += 8;
     }
 
     // Scalar tail for remaining bytes
-    while i < n {
-        if a[i] != b[i] {
-            return i;
-        }
-        i += 1;
-    }
-    n
+    let a = a.get(len..).unwrap_or_default();
+    let b = b.get(len..).unwrap_or_default();
+    len + a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 // ---------------------------------------------------------------------------
-// MmapTable: disk-backed hash table storage via memmap2
+// MmapTable: hash table storage in RAM or in a file, via memmap2
 // ---------------------------------------------------------------------------
 
 mod mmap_table {
     use memmap2::{MmapMut, MmapOptions};
-    use std::io;
+    use std::sync::atomic::AtomicU64;
+    use std::{io, path::Path};
 
-    /// A u64 array backed by a file-backed mmap (via tempfile + memmap2).
-    /// The kernel can page out entries to disk under memory pressure.
-    /// Works cross-platform (Linux, macOS, Windows).
+    /// A u64 array in an anonymous mmap, or in a mmap of an unnamed file,
+    /// whose pages the kernel can write out under memory pressure. Works
+    /// cross-platform (Linux, macOS, Windows).
     pub struct MmapTable {
         mmap: MmapMut,
         len: usize,
     }
 
-    // SAFETY: MmapTable has sole ownership of the mapping (private tempfile,
-    // no external references). The backing memory is never aliased.
-    unsafe impl Send for MmapTable {}
-    // SAFETY: Concurrent reads are plain loads (no tearing for aligned u64).
-    // Concurrent writes during parallel construction use CAS (atomic).
-    // Serial construction is single-threaded (no concurrent writes).
-    unsafe impl Sync for MmapTable {}
-
     impl MmapTable {
         /// Create a new table of `len` u64 slots, all initialized to zero (EMPTY).
         ///
-        /// If `use_ram` is true, uses an anonymous mmap (pinned in RAM, faster).
-        /// If false, uses a file-backed mmap (kernel can page to disk under memory pressure).
-        pub fn new(len: usize, use_ram: bool) -> io::Result<Self> {
-            let byte_len = len * std::mem::size_of::<u64>();
+        /// With no `dir`, uses an anonymous mmap (in RAM, faster).
+        /// Otherwise, uses a mmap of an unnamed file in `dir`, which the kernel
+        /// can page out under memory pressure, unless `dir` is itself in RAM
+        /// (tmpfs).
+        pub fn new(len: usize, dir: Option<&Path>) -> io::Result<Self> {
+            let byte_len = len.checked_mul(size_of::<u64>()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "hash table too large")
+            })?;
 
-            let mmap = if use_ram {
-                // SAFETY: Anonymous mmap — no file backing, no external references.
-                MmapMut::map_anon(byte_len)?
-            } else {
-                // Use current directory (real FS) instead of /tmp (often tmpfs).
-                // On tmpfs, pages can't be paged to disk under memory pressure.
-                let file = tempfile::tempfile_in(".")?;
-                file.set_len(byte_len as u64)?;
-                // SAFETY: Private tempfile — no other process can modify the mapping.
-                // The file handle is dropped after mmap creation; the mapping persists.
-                unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? }
+            let mmap = match dir {
+                None => MmapMut::map_anon(byte_len)?,
+                Some(dir) => {
+                    let file = tempfile::tempfile_in(dir)?;
+                    file.set_len(byte_len as u64)?;
+                    // SAFETY: Private tempfile — no other process can modify the mapping.
+                    // The file handle is dropped after mmap creation; the mapping persists.
+                    unsafe { MmapOptions::new().len(byte_len).map_mut(&file)? }
+                }
             };
 
             // EMPTY = 0, so kernel-zeroed pages are already initialized.
@@ -107,39 +103,15 @@ mod mmap_table {
             Ok(Self { mmap, len })
         }
 
+        /// The slots, which are only ever read and written atomically, so
+        /// threads may insert concurrently.
         #[inline(always)]
-        pub fn get(&self, i: usize) -> u64 {
-            debug_assert!(i < self.len);
-            // SAFETY: i < self.len (debug_assert above), mmap is len*8 bytes,
-            // so pointer offset is within the allocation. Aligned u64 read.
-            unsafe { (self.mmap.as_ptr() as *const u64).add(i).read() }
-        }
-
-        /// Compare-and-swap for lock-free parallel insertion.
-        /// AtomicU64 has identical size/alignment to u64, so the cast is safe
-        /// on the page-aligned mmap memory.
-        #[inline(always)]
-        pub fn cas(&self, i: usize, expected: u64, new: u64) -> Result<u64, u64> {
-            debug_assert!(i < self.len);
-            use std::sync::atomic::{AtomicU64, Ordering};
-            // SAFETY: AtomicU64 has identical size (8) and alignment (8) as u64.
-            // The mmap is page-aligned. i < self.len (debug_assert above).
-            let atom = unsafe { &*(self.mmap.as_ptr() as *const AtomicU64).add(i) };
-            atom.compare_exchange(expected, new, Ordering::Relaxed, Ordering::Relaxed)
-        }
-
-        #[inline(always)]
-        pub fn prefetch(&self, i: usize) {
-            debug_assert!(i < self.len);
-            // SAFETY: i < self.len (debug_assert above), pointer is within allocation.
-            #[cfg(target_arch = "x86_64")]
-            let ptr = unsafe { (self.mmap.as_ptr() as *const u64).add(i) };
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: Prefetch is a CPU hint that cannot cause UB.
-            // Invalid/unmapped addresses are silently ignored by the processor.
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-            }
+        pub fn slots(&self) -> &[AtomicU64] {
+            // SAFETY: the mapping is `len` u64s long and page-aligned, so
+            // aligned for AtomicU64, which has the size and alignment of u64
+            // and accepts any bit pattern. It lives as long as `self`, and
+            // all access goes through the atomics, never through `mmap`.
+            unsafe { std::slice::from_raw_parts(self.mmap.as_ptr().cast::<AtomicU64>(), self.len) }
         }
     }
 }
@@ -153,8 +125,9 @@ use mmap_table::MmapTable;
 /// for the index vs 4n bytes for a suffix array), at the cost of slightly
 /// worse match quality (larger patches).
 ///
-/// The hash table is backed by a file-backed mmap (via tempfile + memmap2),
-/// so the kernel can page out entries under memory pressure. On Linux,
+/// The hash table is backed by an anonymous mmap in RAM, or by a mmap of an
+/// unnamed file in a directory the caller names (via tempfile + memmap2), so
+/// the kernel can page out entries under memory pressure. On Linux,
 /// transparent huge pages are requested to reduce TLB pressure.
 ///
 /// The index stores every block-aligned position in the old text. When queried,
@@ -172,24 +145,29 @@ pub struct HashIndex<'a> {
 }
 
 /// EMPTY = 0: kernel-zeroed mmap pages are born initialized, no memset needed.
-/// Valid entries always have lower 32 bits >= 1 (we store offset+1).
+/// Valid entries always have lower 32 bits >= 1 (we store the block index + 1).
 const EMPTY: u64 = 0;
 
 /// 8 entries per bucket = 8 × 8 bytes = 64 bytes = 1 cache line.
 /// A single DRAM fetch loads the entire bucket's probe sequence.
 const BUCKET_SIZE: usize = 8;
 
-/// Pack a u32 offset and the upper 32 bits of the hash into a single u64.
-/// Stores offset+1 so that EMPTY (0) is unambiguous.
+/// Buckets a lookup searches before giving up, and so the furthest from its
+/// own bucket an entry is worth placing.
+const BUCKETS_PROBED: usize = 5;
+
+/// Pack a block index and the upper 32 bits of the hash into a single u64.
+/// Stores index+1 so that EMPTY (0) is unambiguous; [`table_layout`]
+/// refuses texts of `u32::MAX` blocks or more, so it fits.
 #[inline(always)]
-fn pack_entry(offset: u32, hash: u64) -> u64 {
-    (hash & 0xFFFF_FFFF_0000_0000) | (offset as u64 + 1)
+fn pack_entry(index: u32, hash: u64) -> u64 {
+    (hash & 0xFFFF_FFFF_0000_0000) | (u64::from(index) + 1)
 }
 
-/// Extract the u32 offset from a packed entry.
+/// Extract the block index from a packed entry.
 #[inline(always)]
-fn entry_offset(entry: u64) -> u32 {
-    (entry as u32) - 1
+fn entry_index(entry: u64) -> u32 {
+    (entry as u32).wrapping_sub(1)
 }
 
 /// Extract the 32-bit tag from a packed entry.
@@ -209,156 +187,176 @@ fn wymix(a: u64, b: u64) -> u64 {
 /// fallback to FNV-1a for smaller blocks.
 #[inline(always)]
 fn hash_block(data: &[u8]) -> u64 {
-    if data.len() < 32 {
+    let Some(d) = data.first_chunk::<32>() else {
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in data {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
         return h;
-    }
-    let a = u64::from_ne_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    let b = u64::from_ne_bytes([
-        data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-    ]);
-    let c = u64::from_ne_bytes([
-        data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
-    ]);
-    let d = u64::from_ne_bytes([
-        data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-    ]);
+    };
+    let a = u64::from_ne_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+    let b = u64::from_ne_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]);
+    let c = u64::from_ne_bytes([d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23]]);
+    let d = u64::from_ne_bytes([d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31]]);
     wymix(a ^ 0xa0761d6478bd642f, b ^ 0xe7037ed1a0b428db)
         ^ wymix(c ^ 0x8ebc6af09c88c6e3, d ^ 0x1d8e4e27c47d124f)
 }
 
+#[inline(always)]
+fn prefetch(slot: Option<&AtomicU64>) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(slot) = slot {
+        // SAFETY: Prefetch is a CPU hint that cannot cause UB, and the
+        // address is in the table.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                slot.as_ptr().cast::<i8>().cast_const(),
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = slot;
+}
+
+/// The slots of the table for `text_len` bytes in `block_size`-byte blocks,
+/// and the mask that picks a bucket from a hash.
+fn table_layout(text_len: usize, block_size: usize) -> io::Result<(usize, usize)> {
+    if block_size < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block size cannot be less than 4",
+        ));
+    }
+    let blocks = text_len / block_size;
+    if blocks >= u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the old file has {blocks} blocks, more than the index holds; use a larger block size"
+            ),
+        ));
+    }
+    // Bucket mask: num_buckets is a power of 2, mask = num_buckets - 1.
+    // 50% load factor: num_entries * 2 total slots, divided into buckets.
+    // An empty text still gets one bucket.
+    let buckets = (blocks * 2)
+        .div_ceil(BUCKET_SIZE)
+        .checked_next_power_of_two()
+        .filter(|b| b.checked_mul(BUCKET_SIZE * size_of::<u64>()).is_some())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "hash table too large"))?;
+    Ok((buckets * BUCKET_SIZE, buckets - 1))
+}
+
+/// Bytes of the hash table [`HashIndex::new`] makes for a text of `text_len`
+/// bytes, or the error it would refuse the text or `block_size` with.
+pub fn table_bytes(text_len: usize, block_size: usize) -> io::Result<usize> {
+    Ok(table_layout(text_len, block_size)?.0 * size_of::<u64>())
+}
+
 impl<'a> HashIndex<'a> {
-    /// Build a hash index over `text` with the given block size.
+    /// Build a hash index over `text` with the given block size, on up to
+    /// `threads` threads.
     ///
     /// The block size controls the granularity of matching. Smaller blocks find
-    /// more matches but use more memory. 32 bytes is a good default.
-    pub fn new(text: &'a [u8], block_size: usize, use_ram: bool) -> Self {
-        let index = Self::new_empty(text, block_size, use_ram);
-        index.populate();
-        index
-    }
-
-    /// Allocate an empty hash index (table created but no entries inserted).
-    /// Call `populate()` to insert entries. Lookups on an unpopulated index
-    /// return no matches.
-    pub fn new_empty(text: &'a [u8], block_size: usize, use_ram: bool) -> Self {
-        assert!(block_size >= 4, "block_size must be at least 4");
-
-        if text.len() < block_size {
-            return Self {
-                text,
-                block_size,
-                table: MmapTable::new(BUCKET_SIZE, use_ram).expect("failed to allocate hash table"),
-                mask: 0, // 1 bucket
-            };
-        }
-
-        let num_entries = text.len() / block_size;
-        if num_entries == 0 {
-            return Self {
-                text,
-                block_size,
-                table: MmapTable::new(BUCKET_SIZE, use_ram).expect("failed to allocate hash table"),
-                mask: 0, // 1 bucket
-            };
-        }
-
-        // Bucket mask: num_buckets is a power of 2, mask = num_buckets - 1.
-        // 50% load factor: num_entries * 2 total slots, divided into buckets.
-        let num_buckets = (num_entries * 2)
-            .div_ceil(BUCKET_SIZE)
-            .next_power_of_two()
-            .max(1);
-        let table_size = num_buckets * BUCKET_SIZE;
-        let mask = num_buckets - 1;
-        let table = MmapTable::new(table_size, use_ram).expect("failed to allocate hash table");
-
-        Self {
+    /// more matches but use more memory. It must be at least 4; 32 bytes is a
+    /// good default. The table, [`table_bytes`] long, is a file in `dir`, or
+    /// in RAM when `dir` is `None`.
+    pub fn new(
+        text: &'a [u8],
+        block_size: usize,
+        dir: Option<&Path>,
+        threads: usize,
+    ) -> io::Result<Self> {
+        let (slots, mask) = table_layout(text.len(), block_size)?;
+        let index = Self {
             text,
             block_size,
-            table,
+            table: MmapTable::new(slots, dir)?,
             mask,
-        }
+        };
+        index.populate(threads)?;
+        Ok(index)
     }
 
-    /// Insert all block-aligned positions into the hash table.
-    ///
-    /// Safe to call concurrently with lookups: the CAS-based insertion ensures
-    /// consistent slot states. Lookups during population may miss entries not yet
-    /// inserted (resulting in missed matches, not wrong matches).
-    pub fn populate(&self) {
-        let num_entries = self.text.len() / self.block_size;
-        if num_entries == 0 {
-            return;
-        }
-
-        {
-            use rayon::prelude::*;
-            (0..num_entries).into_par_iter().for_each(|i| {
-                let offset = i * self.block_size;
-                let h = hash_block(&self.text[offset..offset + self.block_size]);
-                let packed = pack_entry(offset as u32, h);
-                let needle_tag = (h >> 32) as u32;
-                let block = &self.text[offset..offset + self.block_size];
-
-                let mut bucket = h as usize & self.mask;
-                loop {
-                    let base = bucket * BUCKET_SIZE;
-                    for slot in base..base + BUCKET_SIZE {
-                        let entry = self.table.get(slot);
-                        if entry == EMPTY {
-                            match self.table.cas(slot, EMPTY, packed) {
-                                Ok(_) => return,
-                                Err(existing) => {
-                                    // Slot claimed by another thread — check duplicate
-                                    if entry_tag(existing) == needle_tag {
-                                        let existing_off = entry_offset(existing) as usize;
-                                        if &self.text[existing_off..existing_off + self.block_size]
-                                            == block
-                                        {
-                                            if offset < existing_off {
-                                                let _ = self.table.cas(slot, existing, packed);
-                                            }
-                                            return;
-                                        }
-                                    }
-                                    // Not a duplicate — continue scanning bucket
-                                }
-                            }
-                        } else if entry_tag(entry) == needle_tag {
-                            let existing_off = entry_offset(entry) as usize;
-                            if &self.text[existing_off..existing_off + self.block_size] == block {
-                                if offset < existing_off {
-                                    let _ = self.table.cas(slot, entry, packed);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    // Bucket full, overflow to next bucket
-                    bucket = (bucket + 1) & self.mask;
-                }
-            });
-        }
+    /// Insert all block-aligned positions into the hash table, each thread
+    /// taking a run of blocks. CAS-based insertion lets them share it.
+    fn populate(&self, threads: usize) -> io::Result<()> {
+        let blocks = self.text.len() / self.block_size;
+        let per_thread = blocks.div_ceil(threads.max(1)).max(1);
+        threads::run(blocks.div_ceil(per_thread), |run| {
+            let first = run * per_thread;
+            let text = self.text.get(first * self.block_size..).unwrap_or_default();
+            for (i, block) in text
+                .chunks_exact(self.block_size)
+                .take(per_thread)
+                .enumerate()
+            {
+                // Fewer than u32::MAX blocks, as table_layout checked.
+                self.insert((first + i) as u32, block);
+            }
+            Ok(())
+        })
     }
 
-    /// Look up a block in the hash table, returning the offset if found.
-    /// Uses a 32-bit hash tag to reject non-matching probes without accessing
-    /// the text, avoiding expensive cache misses and memcmp on most probes.
+    /// The slots of bucket `bucket`.
     #[inline(always)]
-    fn lookup(&self, block: &[u8]) -> Option<usize> {
-        let h = hash_block(block);
-        self.lookup_with_hash(block, h)
+    fn bucket(&self, bucket: usize) -> &[AtomicU64] {
+        let start = bucket * BUCKET_SIZE;
+        self.table
+            .slots()
+            .get(start..start + BUCKET_SIZE)
+            .unwrap_or_default()
     }
 
-    /// Look up a block using a pre-computed hash, avoiding redundant hashing
-    /// when the hash was already computed by prefetch_block.
+    /// The text of block `index`.
+    #[inline(always)]
+    fn block(&self, index: u32) -> Option<&'a [u8]> {
+        let start = index as usize * self.block_size;
+        self.text.get(start..start + self.block_size)
+    }
+
+    fn insert(&self, index: u32, block: &[u8]) {
+        let h = hash_block(block);
+        let packed = pack_entry(index, h);
+        let needle_tag = entry_tag(packed);
+
+        let mut bucket = h as usize & self.mask;
+        for _ in 0..BUCKETS_PROBED {
+            for slot in self.bucket(bucket) {
+                let mut entry = slot.load(Ordering::Relaxed);
+                if entry == EMPTY {
+                    match slot.compare_exchange(EMPTY, packed, Ordering::Relaxed, Ordering::Relaxed)
+                    {
+                        Ok(_) => return,
+                        // Slot claimed by another thread — check duplicate
+                        Err(existing) => entry = existing,
+                    }
+                }
+                if entry_tag(entry) == needle_tag && self.block(entry_index(entry)) == Some(block) {
+                    // Keep the earliest of equal blocks.
+                    if index < entry_index(entry) {
+                        let _ = slot.compare_exchange(
+                            entry,
+                            packed,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    return;
+                }
+                // Not a duplicate — continue scanning bucket
+            }
+            // Bucket full, overflow to next bucket
+            bucket = (bucket + 1) & self.mask;
+        }
+    }
+
+    /// Look up a block using a pre-computed hash, returning its offset in
+    /// the text if found. Uses a 32-bit hash tag to reject non-matching probes
+    /// without accessing the text, avoiding expensive cache misses and memcmp
+    /// on most probes.
     ///
     /// Bucket hashing: hash → bucket index, scan all 8 entries in the bucket
     /// (1 cache line = 1 DRAM fetch). Entries are packed from the front, so
@@ -367,69 +365,40 @@ impl<'a> HashIndex<'a> {
     fn lookup_with_hash(&self, block: &[u8], h: u64) -> Option<usize> {
         let needle_tag = (h >> 32) as u32;
         let mut bucket = h as usize & self.mask;
-        let mut probes = 0;
-        loop {
-            let base = bucket * BUCKET_SIZE;
-            for i in 0..BUCKET_SIZE {
-                let entry = self.table.get(base + i);
+        for _ in 0..BUCKETS_PROBED {
+            for slot in self.bucket(bucket) {
+                let entry = slot.load(Ordering::Relaxed);
                 if entry == EMPTY {
                     return None;
                 }
                 if entry_tag(entry) == needle_tag {
-                    let o = entry_offset(entry) as usize;
-                    if &self.text[o..o + self.block_size] == block {
-                        return Some(o);
+                    let index = entry_index(entry);
+                    if self.block(index) == Some(block) {
+                        return Some(index as usize * self.block_size);
                     }
                 }
             }
             // Bucket full with no match — probe next bucket (rare at 50% load)
-            probes += 1;
-            if probes > 4 {
-                return None;
-            }
             bucket = (bucket + 1) & self.mask;
-            self.table.prefetch(bucket * BUCKET_SIZE);
         }
+        None
     }
-}
 
-impl<'a> HashIndex<'a> {
     /// Prefetch the hash table slot for a block, so a subsequent lookup is faster.
-    /// Returns the computed hash so it can be reused by lookup_with_hash.
+    /// Returns the computed hash so it can be reused by
+    /// [`longest_substring_match_with_hash`](Self::longest_substring_match_with_hash).
     #[inline(always)]
     pub fn prefetch_block(&self, data: &[u8]) -> Option<u64> {
-        if data.len() >= self.block_size {
-            let h = hash_block(&data[..self.block_size]);
-            let bucket = h as usize & self.mask;
-            self.table.prefetch(bucket * BUCKET_SIZE);
-            Some(h)
-        } else {
-            None
-        }
+        let h = hash_block(data.get(..self.block_size)?);
+        let bucket = h as usize & self.mask;
+        prefetch(self.table.slots().get(bucket * BUCKET_SIZE));
+        Some(h)
     }
 
     pub fn longest_substring_match(&self, needle: &[u8]) -> LongestCommonSubstring {
-        // If needle is shorter than block_size, we can't hash it
-        if needle.len() < self.block_size || self.text.len() < self.block_size {
-            return LongestCommonSubstring { start: 0, len: 0 };
-        }
-
-        // Hash the first block_size bytes of the needle and look up
-        let block = &needle[..self.block_size];
-        if let Some(text_offset) = self.lookup(block) {
-            // Found a match — extend it forward using common_prefix_len.
-            // Skip block_size bytes: lookup already verified they match.
-            let match_len = self.block_size
-                + common_prefix_len(
-                    &self.text[text_offset + self.block_size..],
-                    &needle[self.block_size..],
-                );
-            LongestCommonSubstring {
-                start: text_offset,
-                len: match_len,
-            }
-        } else {
-            LongestCommonSubstring { start: 0, len: 0 }
+        match needle.get(..self.block_size) {
+            Some(block) => self.extend(needle, block, hash_block(block)),
+            None => NO_MATCH,
         }
     }
 
@@ -439,24 +408,25 @@ impl<'a> HashIndex<'a> {
         needle: &[u8],
         h: u64,
     ) -> LongestCommonSubstring {
-        if needle.len() < self.block_size || self.text.len() < self.block_size {
-            return LongestCommonSubstring { start: 0, len: 0 };
+        match needle.get(..self.block_size) {
+            Some(block) => self.extend(needle, block, h),
+            None => NO_MATCH,
         }
+    }
 
-        let block = &needle[..self.block_size];
-        if let Some(text_offset) = self.lookup_with_hash(block, h) {
-            // Skip block_size bytes: lookup already verified they match.
-            let match_len = self.block_size
-                + common_prefix_len(
-                    &self.text[text_offset + self.block_size..],
-                    &needle[self.block_size..],
-                );
-            LongestCommonSubstring {
-                start: text_offset,
-                len: match_len,
-            }
-        } else {
-            LongestCommonSubstring { start: 0, len: 0 }
+    /// Find `block`, the start of `needle`, and extend the match forward
+    /// using common_prefix_len.
+    #[inline(always)]
+    fn extend(&self, needle: &[u8], block: &[u8], h: u64) -> LongestCommonSubstring {
+        let Some(start) = self.lookup_with_hash(block, h) else {
+            return NO_MATCH;
+        };
+        // Skip block_size bytes: lookup already verified they match.
+        let text = self.text.get(start + self.block_size..).unwrap_or_default();
+        let needle = needle.get(self.block_size..).unwrap_or_default();
+        LongestCommonSubstring {
+            start,
+            len: self.block_size + common_prefix_len(text, needle),
         }
     }
 }
@@ -465,10 +435,14 @@ impl<'a> HashIndex<'a> {
 mod tests {
     use super::*;
 
+    fn index(text: &[u8]) -> HashIndex<'_> {
+        HashIndex::new(text, 4, None, 2).unwrap()
+    }
+
     #[test]
     fn basic_match() {
         let text = b"hello world, hello rust!";
-        let idx = HashIndex::new(text, 4, true);
+        let idx = index(text);
         // "hell" appears at offset 0 and 13. The hash table stores only one
         // entry per unique block, so we get whichever one was stored. The match
         // extends forward from that point. Either way we get a valid match.
@@ -484,7 +458,7 @@ mod tests {
     #[test]
     fn no_match() {
         let text = b"abcdefghijklmnop";
-        let idx = HashIndex::new(text, 4, true);
+        let idx = index(text);
         let result = idx.longest_substring_match(b"xyzw1234");
         assert_eq!(result.len, 0);
     }
@@ -492,7 +466,7 @@ mod tests {
     #[test]
     fn empty_text() {
         let text = b"";
-        let idx = HashIndex::new(text, 4, true);
+        let idx = index(text);
         let result = idx.longest_substring_match(b"hello");
         assert_eq!(result.len, 0);
     }
@@ -500,7 +474,7 @@ mod tests {
     #[test]
     fn short_needle() {
         let text = b"abcdefghijklmnop";
-        let idx = HashIndex::new(text, 4, true);
+        let idx = index(text);
         // Needle shorter than block_size — can't hash
         let result = idx.longest_substring_match(b"ab");
         assert_eq!(result.len, 0);
@@ -511,9 +485,44 @@ mod tests {
         // "the " starts at offset 0 (aligned to block_size=4),
         // so "the lazy" should find a match starting there or at offset 31.
         let text = b"the quick brown fox jumps over the lazy dog!";
-        let idx = HashIndex::new(text, 4, true);
+        let idx = index(text);
         let result = idx.longest_substring_match(b"the lazy dog!");
         // "the " at offset 32 is block-aligned (32/4=8), should match
         assert!(result.len >= 4, "expected match >= 4, got {}", result.len);
+    }
+
+    #[test]
+    fn keeps_the_earliest_of_equal_blocks() {
+        let text = b"abcdXXXXabcdYYYYabcd";
+        for threads in [1, 3] {
+            let idx = HashIndex::new(text, 4, None, threads).unwrap();
+            assert_eq!(idx.longest_substring_match(b"abcdZ").start, 0);
+        }
+    }
+
+    #[test]
+    fn refuses_small_blocks() {
+        let err = HashIndex::new(b"abcdefgh", 3, None, 1).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn common_prefix() {
+        let a = b"0123456789abcdefXYZ";
+        for len in 0..a.len() {
+            let mut b = a.to_vec();
+            b[len] = b'!';
+            assert_eq!(common_prefix_len(a, &b), len);
+            assert_eq!(common_prefix_len(&a[..len], a), len);
+        }
+        assert_eq!(common_prefix_len(a, a), a.len());
+    }
+
+    #[test]
+    fn table_sizes() {
+        assert_eq!(table_bytes(0, 32).unwrap(), 64);
+        assert_eq!(table_bytes(31, 32).unwrap(), 64);
+        // 1000 blocks need 2000 slots: 250 buckets, rounded up to 256.
+        assert_eq!(table_bytes(32_000, 32).unwrap(), 256 * 64);
     }
 }

@@ -50,9 +50,14 @@ struct Diff {
     /// Maximize compression (zstd level 22); slower but ~30% smaller patches
     #[arg(long)]
     max: bool,
-    /// Keep hash table in RAM (faster but uses ~500 MB+ for large files)
+    /// Hold bidiff's own memory to this many MiB, spilling the hash table
+    /// to --temp-dir when it does not fit (default: no limit, all in RAM)
     #[arg(long)]
-    ram: bool,
+    memory_limit_mb: Option<usize>,
+    /// Where the hash table and large compressed chunks spill to under
+    /// --memory-limit-mb (default: the system's temporary directory)
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -93,9 +98,14 @@ struct Cycle {
     /// Maximize compression (zstd level 22); slower but ~30% smaller patches
     #[arg(long)]
     max: bool,
-    /// Keep hash table in RAM (faster but uses ~500 MB+ for large files)
+    /// Hold bidiff's own memory to this many MiB, spilling the hash table
+    /// to --temp-dir when it does not fit (default: no limit, all in RAM)
     #[arg(long)]
-    ram: bool,
+    memory_limit_mb: Option<usize>,
+    /// Where the hash table and large compressed chunks spill to under
+    /// --memory-limit-mb (default: the system's temporary directory)
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
     /// Also measure peak anonymous RSS (runs a separate diff pass with a polling thread)
     #[arg(long)]
     with_anon: bool,
@@ -190,7 +200,8 @@ fn do_cycle(
         scan_chunk_mb,
         threads,
         max,
-        ram,
+        memory_limit_mb,
+        temp_dir,
         with_anon,
     }: &Cycle,
 ) -> Result<()> {
@@ -209,7 +220,8 @@ fn do_cycle(
         scan_chunk_mb: *scan_chunk_mb,
         threads: *threads,
         max: *max,
-        ram: *ram,
+        memory_limit_mb: *memory_limit_mb,
+        temp_dir: temp_dir.clone(),
     };
 
     // Separate anon RSS measurement pass (if requested) — uses a polling thread
@@ -381,7 +393,8 @@ fn do_diff(
         scan_chunk_mb,
         threads,
         max,
-        ram,
+        memory_limit_mb,
+        temp_dir,
     }: &Diff,
 ) -> Result<()> {
     let start = Instant::now();
@@ -394,8 +407,14 @@ fn do_diff(
     newer_contents.advise(memmap2::Advice::Sequential).ok();
 
     let scan_chunk_size = Some(scan_chunk_mb * 1024 * 1024);
-    let mut diff_params = DiffParams::with_threads(*block_size, scan_chunk_size, *threads).unwrap();
-    diff_params.use_ram = *ram;
+    let mut diff_params = DiffParams::with_threads(*block_size, scan_chunk_size, *threads)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(mb) = memory_limit_mb {
+        diff_params = diff_params.with_memory_limit(mb.saturating_mul(1 << 20));
+    }
+    if let Some(dir) = temp_dir {
+        diff_params = diff_params.with_temp_dir(dir);
+    }
     let zstd_level = if *max { 22 } else { 3 };
     let mut out = BufWriter::new(File::create(patch).context("create patch file")?);
     bidiff::simple_diff_chunked_with_params(

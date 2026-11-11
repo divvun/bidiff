@@ -113,7 +113,6 @@ impl BlockHasher {
     /// Hash `block`, which is exactly [`BLOCK_LEN`] bytes, and return a
     /// buffer to fill next.
     pub(crate) fn push_full(&mut self, mut block: Vec<u8>) -> Result<Vec<u8>, Error> {
-        debug_assert_eq!(block.len(), BLOCK_LEN);
         match self {
             BlockHasher::Inline(hasher) => {
                 hasher.update(&block);
@@ -173,6 +172,11 @@ impl Helpers {
         self.jobs = None;
 
         let blocks = usize::try_from(self.dispatched).map_err(|_| helpers_failed())?;
+        // The tree below splits blocks as BLAKE3 splits bytes, so the two
+        // must agree.
+        if self.dispatched != total.div_ceil(BLOCK_LEN as u64) {
+            return Err(helpers_failed());
+        }
         let mut cvs = vec![[0; 32]; blocks];
         for _ in 0..blocks {
             let (index, cv) = self.cvs.recv().map_err(|_| helpers_failed())?;
@@ -185,8 +189,12 @@ impl Helpers {
 /// The chaining value of `len` bytes whose blocks have chaining values
 /// `cvs`, split as BLAKE3 splits them.
 fn subtree(cvs: &[ChainingValue], len: u64) -> ChainingValue {
-    if let [only] = cvs {
-        return *only;
+    match cvs {
+        [only] => return *only,
+        // Only if a count disagreed with its length; the result hash is
+        // then wrong and refused, rather than recursing without end.
+        [] => return [0; 32],
+        _ => {}
     }
     let (left, left_len, right) = split(cvs, len);
     merge_subtrees_non_root(
@@ -201,7 +209,9 @@ fn subtree(cvs: &[ChainingValue], len: u64) -> ChainingValue {
 /// split falls between blocks.
 fn split(cvs: &[ChainingValue], len: u64) -> (&[ChainingValue], u64, &[ChainingValue]) {
     let left_len = left_subtree_len(len);
-    let (left, right) = cvs.split_at((left_len / BLOCK_LEN as u64) as usize);
+    let mid = (left_len / BLOCK_LEN as u64) as usize;
+    // Every block count passed in matches its length, so mid < cvs.len().
+    let (left, right) = cvs.split_at_checked(mid).unwrap_or((cvs, &[]));
     (left, left_len, right)
 }
 

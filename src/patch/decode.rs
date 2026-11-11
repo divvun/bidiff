@@ -49,15 +49,17 @@ impl<'o> SliceSink<'o> {
     }
 
     fn take(&mut self, n: usize) -> Result<&mut [u8], Error> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.out.len());
-        let Some(end) = end else {
+        let pos = self.pos;
+        let dst = pos
+            .checked_add(n)
+            .and_then(|end| self.out.get_mut(pos..end));
+        let Some(dst) = dst else {
             return Err(Error::Io(io::Error::new(
                 ErrorKind::InvalidInput,
                 "output slice is shorter than the chunk",
             )));
         };
-        let dst = &mut self.out[self.pos..end];
-        self.pos = end;
+        self.pos = pos + n;
         Ok(dst)
     }
 }
@@ -125,8 +127,9 @@ impl<W: Write + ?Sized> Sink for WriteSink<'_, '_, W> {
         self.total += src.len() as u64;
         while !src.is_empty() {
             let n = self.room()?.min(src.len());
-            self.buf.extend_from_slice(&src[..n]);
-            src = &src[n..];
+            let (head, rest) = src.split_at_checked(n).unwrap_or((src, &[]));
+            self.buf.extend_from_slice(head);
+            src = rest;
         }
         Ok(())
     }
@@ -136,14 +139,12 @@ impl<W: Write + ?Sized> Sink for WriteSink<'_, '_, W> {
         self.total += delta.len() as u64;
         while !delta.is_empty() {
             let n = self.room()?.min(delta.len());
-            self.buf.extend(
-                delta[..n]
-                    .iter()
-                    .zip(&old[..n])
-                    .map(|(d, o)| d.wrapping_add(*o)),
-            );
-            delta = &delta[n..];
-            old = &old[n..];
+            let (d, delta_rest) = delta.split_at_checked(n).unwrap_or((delta, &[]));
+            let (o, old_rest) = old.split_at_checked(n).unwrap_or((old, &[]));
+            self.buf
+                .extend(d.iter().zip(o).map(|(d, o)| d.wrapping_add(*o)));
+            delta = delta_rest;
+            old = old_rest;
         }
         Ok(())
     }
@@ -213,16 +214,20 @@ impl<'c, 'd> Instructions<'c, 'd> {
 
     #[cold]
     fn refill(&mut self, want: usize) -> Result<(), Error> {
-        self.buf.copy_within(self.start..self.end, 0);
-        self.end -= self.start;
+        // Clamped, though start <= end <= buf.len() always holds, so the
+        // copy cannot go out of range.
+        let end = self.end.min(self.buf.len());
+        let start = self.start.min(end);
+        self.buf.copy_within(start..end, 0);
+        self.end = end - start;
         self.start = 0;
         while self.end < want && !self.frame_done {
             let mut input = InBuffer::around(self.input);
-            let mut output = OutBuffer::around(&mut self.buf[self.end..]);
+            let mut output = OutBuffer::around(self.buf.get_mut(self.end..).unwrap_or_default());
             let status = self.dec.decompress_stream(&mut output, &mut input);
             let (read, written) = (input.pos(), output.pos());
             let remaining = status.map_err(|c| self.compression(zstd_error(c)))?;
-            self.input = &self.input[read..];
+            self.input = self.input.get(read..).unwrap_or_default();
             self.end += written;
             self.produced += written as u64;
             if self.produced > self.raw_len {
@@ -259,7 +264,7 @@ impl<'c, 'd> Instructions<'c, 'd> {
     #[inline]
     fn varint(&mut self) -> Result<u64, Error> {
         self.fill(MAX_VARINT_LEN)?;
-        let bytes = &self.buf[self.start..self.end];
+        let bytes = self.buf.get(self.start..self.end).unwrap_or_default();
         let mut value = 0u64;
         for (i, &b) in bytes.iter().take(MAX_VARINT_LEN).enumerate() {
             // The tenth byte holds bit 63 alone; anything more overflows.
@@ -288,7 +293,8 @@ impl<'c, 'd> Instructions<'c, 'd> {
                 return Err(self.truncated());
             }
             let piece = (self.available() as u64).min(n) as usize;
-            f(&self.buf[self.start..self.start + piece])?;
+            let bytes = self.buf.get(self.start..self.start + piece);
+            f(bytes.ok_or_else(|| self.truncated())?)?;
             self.advance(piece);
             n -= piece as u64;
         }
@@ -371,13 +377,14 @@ pub(crate) fn run_chunk<S: Sink>(
             let src = old_range(old_pos, add_len, at)?;
             reserve(&mut out_pos, add_len, at)?;
             old_pos += add_len;
-            let base = &old[src];
+            let base = old.get(src).ok_or(base_range(at))?;
             if add_tag & 1 == 1 {
                 sink.copy(base)?;
             } else {
                 let mut done = 0;
                 r.take(add_len, |delta| {
-                    sink.add(delta, &base[done..done + delta.len()])?;
+                    let base = base.get(done..done + delta.len()).ok_or(base_range(at))?;
+                    sink.add(delta, base)?;
                     done += delta.len();
                     Ok(())
                 })?;
@@ -392,7 +399,7 @@ pub(crate) fn run_chunk<S: Sink>(
             if copy_len > 0 {
                 let src = old_range(from, copy_len, at)?;
                 reserve(&mut out_pos, copy_len, at)?;
-                sink.copy(&old[src])?;
+                sink.copy(old.get(src).ok_or(base_range(at))?)?;
             }
         } else if copy_len > 0 {
             reserve(&mut out_pos, copy_len, at)?;
